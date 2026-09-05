@@ -12,6 +12,7 @@ import { recordingsRouter } from './modules/recordings/recordings.routes';
 import { healthRouter } from './modules/health/health.routes';
 import { adminRouter } from './modules/admin/admin.routes';
 import { followUpsRouter } from './modules/followups/followups.routes';
+import { remoteCallsRouter } from './modules/remote-calls/remoteCalls.routes';
 
 export function createApp() {
   const app = express();
@@ -35,6 +36,7 @@ export function createApp() {
   app.use('/health', healthRouter);
   app.use('/api/auth', authRouter);
   app.use('/api/call-sessions', authenticate, callSessionsRouter);
+  app.use('/api/remote-calls', authenticate, remoteCallsRouter);
   app.use('/api/leads', authenticate, leadsRouter);
   app.use('/api/recordings', authenticate, recordingsRouter);
   app.use('/api/follow-ups', authenticate, followUpsRouter);

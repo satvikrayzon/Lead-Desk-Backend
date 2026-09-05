@@ -6,3 +6,5 @@ export { CallRecording } from './CallRecording';
 export { LeadFollowUp } from './LeadFollowUp';
 export { AuditLog } from './AuditLog';
 export { LeadImportBatch } from './LeadImportBatch';
+export { RemoteCall } from './RemoteCall';
+export { AgentDevice } from './AgentDevice';

@@ -21,8 +21,12 @@ function daysAgo(n: number) {
   return d;
 }
 
+/** Calendar day in the server's local timezone (not UTC). */
 function dateKey(d: Date) {
-  return d.toISOString().slice(0, 10);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 /** Company-wide dashboard: summary + per-telecaller report + 7-day call trend. */
