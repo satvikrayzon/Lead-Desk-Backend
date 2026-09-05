@@ -1,5 +1,7 @@
 import { Router, Response, NextFunction } from 'express';
 
+import { Types } from 'mongoose';
+
 import { z } from 'zod';
 
 import { Lead, LeadAssignment, CallRecording, User } from '../../models';
@@ -65,6 +67,22 @@ leadsRouter.post('/import', uploadExcel.single('file'), async (req: AuthRequest,
 
 
     const userId = req.user!.id;
+    const role = req.user!.role;
+    const requestedAssignTo =
+      typeof req.body?.assign_to_user_id === 'string' ? String(req.body.assign_to_user_id).trim() : '';
+
+    let assignToUserId = userId;
+    if ((role === 'admin' || role === 'manager') && requestedAssignTo) {
+      if (!Types.ObjectId.isValid(requestedAssignTo)) {
+        throw new AppError(400, 'Invalid assign_to_user_id.');
+      }
+      const target = await User.findById(requestedAssignTo);
+      if (!target || !target.isActive) throw new AppError(404, 'Target telecaller not found.');
+      if (!['agent', 'manager'].includes(target.role)) {
+        throw new AppError(400, 'Target user must be a telecaller or team leader.');
+      }
+      assignToUserId = requestedAssignTo;
+    }
 
     const batch = await importLeadsFromBuffer({
 
@@ -74,7 +92,7 @@ leadsRouter.post('/import', uploadExcel.single('file'), async (req: AuthRequest,
 
       uploadedByUserId: userId,
 
-      assignToUserId: userId,
+      assignToUserId,
 
     });
 
@@ -97,6 +115,8 @@ leadsRouter.post('/import', uploadExcel.single('file'), async (req: AuthRequest,
         skipped_count: batch.skippedCount,
 
         error_count: batch.errorCount,
+
+        assign_to_user_id: assignToUserId,
 
       },
 

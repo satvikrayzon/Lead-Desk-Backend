@@ -3,6 +3,7 @@ import { createReadStream } from 'fs';
 import { CallRecording, Lead, LeadFollowUp } from '../../models';
 import { linkFollowUpsToRecording } from '../../utils/linkFollowUpRecording';
 import { env } from '../../config/env';
+import { logger } from '../../config/logger';
 import { uploadToS3, deleteFromS3, getPresignedUrl } from '../../config/s3';
 import { AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
@@ -107,6 +108,21 @@ recordingsRouter.post(
       uploadedS3Key = s3Key;
 
       const storageBucket = env.S3_ENABLED ? env.S3_BUCKET_NAME : 'local';
+      const storageMode = env.S3_ENABLED ? 's3' : 'local';
+
+      logger.info(
+        {
+          storageMode,
+          bucket: storageBucket,
+          key: s3Key,
+          leadId: lead_id,
+          agentId: userId,
+          fileSizeBytes: req.file.size,
+          mimeType: req.file.mimetype,
+          requestId: req.requestId,
+        },
+        'Recording store started'
+      );
 
       try {
         if (env.S3_ENABLED) {
@@ -118,8 +134,21 @@ recordingsRouter.post(
           });
         } else {
           await saveLocalRecording(s3Key, req.file.buffer);
+          logger.info({ key: s3Key, fileSizeBytes: req.file.size }, 'Local recording store succeeded');
         }
-      } catch {
+      } catch (storeErr) {
+        logger.error(
+          {
+            err: storeErr,
+            storageMode,
+            bucket: storageBucket,
+            key: s3Key,
+            leadId: lead_id,
+            agentId: userId,
+            requestId: req.requestId,
+          },
+          'Recording store failed'
+        );
         throw new AppError(500, 'Failed to store recording.');
       }
 
@@ -143,11 +172,27 @@ recordingsRouter.post(
           uploadStatus: 'uploaded',
         });
       } catch (dbErr: unknown) {
+        logger.error(
+          {
+            err: dbErr,
+            storageMode,
+            bucket: storageBucket,
+            key: s3Key,
+            leadId: lead_id,
+            agentId: userId,
+            requestId: req.requestId,
+          },
+          'Recording DB create failed after file store'
+        );
+
         if (uploadedS3Key && env.S3_ENABLED) {
           try {
             await deleteFromS3(uploadedS3Key);
-          } catch {
-            // ignore cleanup failure
+          } catch (cleanupErr) {
+            logger.error(
+              { err: cleanupErr, key: uploadedS3Key },
+              'S3 cleanup after DB failure also failed'
+            );
           }
         }
 
@@ -194,6 +239,21 @@ recordingsRouter.post(
         ipAddress: req.ip,
       });
 
+      logger.info(
+        {
+          recordingId: recording._id.toString(),
+          storageMode,
+          bucket: storageBucket,
+          key: s3Key,
+          leadId: lead_id,
+          agentId: userId,
+          fileSizeBytes: req.file.size,
+          uploadStatus: recording.uploadStatus,
+          requestId: req.requestId,
+        },
+        'Recording stored successfully'
+      );
+
       res.json({
         recording_id: recording._id.toString(),
         id: recording._id.toString(),
@@ -202,8 +262,11 @@ recordingsRouter.post(
       if (uploadedS3Key && env.S3_ENABLED && err instanceof AppError && err.statusCode === 500) {
         try {
           await deleteFromS3(uploadedS3Key);
-        } catch {
-          // ignore cleanup failure
+        } catch (cleanupErr) {
+          logger.error(
+            { err: cleanupErr, key: uploadedS3Key },
+            'S3 cleanup after upload error also failed'
+          );
         }
       }
       next(err);
@@ -257,16 +320,55 @@ recordingsRouter.get('/:recordingId', async (req: AuthRequest, res: Response, ne
     }
 
     if (!env.S3_ENABLED || recording.s3Bucket === 'local') {
+      logger.info(
+        {
+          recordingId,
+          storageMode: 'local',
+          key: recording.s3Key,
+          requestId: req.requestId,
+        },
+        'Recording URL served from local storage'
+      );
       return res.json({
         url: `${env.API_BASE_URL}/api/recordings/${recordingId}/file`,
         expires_at: null,
       });
     }
 
+    logger.info(
+      {
+        recordingId,
+        storageMode: 's3',
+        bucket: recording.s3Bucket,
+        key: recording.s3Key,
+        requestId: req.requestId,
+      },
+      'Recording URL fetch from S3 started'
+    );
+
     const { url, expiresAt } = await getPresignedUrl(recording.s3Key);
+
+    logger.info(
+      {
+        recordingId,
+        bucket: recording.s3Bucket,
+        key: recording.s3Key,
+        expiresAt,
+        requestId: req.requestId,
+      },
+      'Recording URL fetched from S3 successfully'
+    );
 
     res.json({ url, expires_at: expiresAt });
   } catch (err) {
+    logger.error(
+      {
+        err,
+        recordingId: req.params.recordingId,
+        requestId: req.requestId,
+      },
+      'Recording URL fetch failed'
+    );
     next(err);
   }
 });

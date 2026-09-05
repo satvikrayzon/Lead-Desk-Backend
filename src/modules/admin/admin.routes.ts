@@ -1,12 +1,16 @@
 import { Router, Response, NextFunction } from 'express';
+import { Types } from 'mongoose';
+import { z } from 'zod';
 import { Lead, LeadAssignment, Team, User } from '../../models';
 import { AuthRequest, requireRoles } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
-import { formatLead } from '../../utils/helpers';
+import { createAuditLog, formatLead } from '../../utils/helpers';
 import { buildLeadTrackerWorkbook, loadFollowUpsByLeadId } from '../../services/excelExportService';
+import { getNextLeadCode } from '../../services/leadCodeService';
 import { ILead } from '../../models/Lead';
 import { adminUsersRouter } from './adminUsers.routes';
 import { adminTeamsRouter } from './adminTeams.routes';
+import { adminDashboardRouter } from './adminDashboard.routes';
 
 export const adminRouter = Router();
 
@@ -14,6 +18,95 @@ adminRouter.use(requireRoles('admin', 'manager'));
 
 adminRouter.use('/users', adminUsersRouter);
 adminRouter.use('/teams', adminTeamsRouter);
+adminRouter.use('/dashboard', adminDashboardRouter);
+
+const createLeadSchema = z.object({
+  company_name: z.string().min(1),
+  contact_person: z.string().optional(),
+  contact_mobile: z.string().min(5),
+  contact_email: z.string().optional(),
+  state: z.string().optional(),
+  district: z.string().optional(),
+  address: z.string().optional(),
+  assign_to_user_id: z.string().min(1),
+});
+
+/** Create a new lead and assign it to a telecaller. */
+adminRouter.post('/leads', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const parsed = createLeadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new AppError(400, parsed.error.issues.map((i) => i.message).join('; '));
+    }
+
+    const {
+      company_name: companyName,
+      contact_person: contactPerson,
+      contact_mobile: contactMobile,
+      contact_email: contactEmail,
+      state,
+      district,
+      address,
+      assign_to_user_id: assignToUserId,
+    } = parsed.data;
+
+    if (!Types.ObjectId.isValid(assignToUserId)) {
+      throw new AppError(400, 'Invalid assign_to_user_id.');
+    }
+
+    const agent = await User.findById(assignToUserId);
+    if (!agent || !agent.isActive) throw new AppError(404, 'Target telecaller not found.');
+    if (!['agent', 'manager'].includes(agent.role)) {
+      throw new AppError(400, 'Target user must be a telecaller or team leader.');
+    }
+
+    const leadCode = await getNextLeadCode(agent.name, assignToUserId);
+
+    const lead = await Lead.create({
+      companyName: companyName.trim(),
+      company: companyName.trim(),
+      name: (contactPerson?.trim() || companyName.trim()),
+      contactPerson: contactPerson?.trim() || undefined,
+      contactMobile: contactMobile.trim(),
+      phoneNumber: contactMobile.trim(),
+      contactEmail: contactEmail?.trim() || undefined,
+      state: state?.trim() || undefined,
+      district: district?.trim() || undefined,
+      address: address?.trim() || undefined,
+      leadCode,
+      leadDate: new Date(),
+      salesExecutive: agent.name,
+      teamLeader: agent.teamName || undefined,
+      leadStatus: 'open',
+      leadStage: 'not_contacted',
+      status: 'new',
+      callCount: 0,
+    });
+
+    const assignment = await LeadAssignment.create({
+      leadId: lead._id,
+      agentId: assignToUserId,
+      assignedBy: req.user!.id,
+      assignedAt: new Date(),
+      isActive: true,
+    });
+
+    await createAuditLog({
+      userId: req.user!.id,
+      action: 'admin.lead.created',
+      entityType: 'lead',
+      entityId: lead._id.toString(),
+      metadata: { assign_to_user_id: assignToUserId },
+      ipAddress: req.ip,
+    });
+
+    res.status(201).json({
+      data: formatLead(lead, assignment.assignedAt, agent),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 function buildLeadFilter(query: AuthRequest['query']) {
   const filter: Record<string, unknown> = {};
@@ -33,12 +126,14 @@ type PopulatedAgent = {
   teamId?: { toString(): string } | null;
 };
 
-async function fetchExportRows(query: AuthRequest['query']) {
+async function fetchExportRows(query: AuthRequest['query'], options: { applyTab?: boolean } = {}) {
+  const applyTab = options.applyTab !== false;
   const leadFilter = buildLeadFilter(query);
   const search = typeof query.search === 'string' ? query.search.trim().toLowerCase() : '';
   const teamId = typeof query.team_id === 'string' ? query.team_id : '';
   const salesExecutiveId =
     typeof query.sales_executive_id === 'string' ? query.sales_executive_id : '';
+  const tab = typeof query.tab === 'string' ? query.tab : '';
 
   const assignments = await LeadAssignment.find({ isActive: true }).populate<{
     leadId: ILead;
@@ -80,6 +175,15 @@ async function fetchExportRows(query: AuthRequest['query']) {
         (lead.district ?? '').toLowerCase().includes(search)
       );
     });
+  }
+
+  if (applyTab) {
+    if (tab === 'called') {
+      rows = rows.filter((r) => (r.lead.callCount ?? 0) > 0);
+    } else if (tab === 'remaining' || tab === 'raw' || !tab) {
+      // Default: raw / not contacted
+      rows = rows.filter((r) => (r.lead.callCount ?? 0) === 0);
+    }
   }
 
   return rows;
@@ -139,7 +243,18 @@ adminRouter.get('/leads', async (req: AuthRequest, res: Response, next: NextFunc
   try {
     const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
     const limit = 50;
-    const rows = await fetchExportRows(req.query);
+
+    // Counts for both tabs use the same filters (minus tab).
+    const allRows = await fetchExportRows(req.query, { applyTab: false });
+    const remainingCount = allRows.filter((r) => (r.lead.callCount ?? 0) === 0).length;
+    const calledCount = allRows.filter((r) => (r.lead.callCount ?? 0) > 0).length;
+
+    const tab = typeof req.query.tab === 'string' ? req.query.tab : 'remaining';
+    const rows =
+      tab === 'called'
+        ? allRows.filter((r) => (r.lead.callCount ?? 0) > 0)
+        : allRows.filter((r) => (r.lead.callCount ?? 0) === 0);
+
     const total = rows.length;
     const totalPages = Math.max(1, Math.ceil(total / limit));
     const slice = rows.slice((page - 1) * limit, page * limit);
@@ -158,7 +273,14 @@ adminRouter.get('/leads', async (req: AuthRequest, res: Response, next: NextFunc
 
     res.json({
       data,
-      meta: { total, page, total_pages: totalPages },
+      meta: {
+        total,
+        page,
+        total_pages: totalPages,
+        remaining_count: remainingCount,
+        called_count: calledCount,
+        tab: tab === 'called' ? 'called' : 'remaining',
+      },
     });
   } catch (err) {
     next(err);
