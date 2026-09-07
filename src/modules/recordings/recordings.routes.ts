@@ -1,5 +1,5 @@
 import { Router, Response, NextFunction } from 'express';
-import { createReadStream } from 'fs';
+import { createReadStream, existsSync } from 'fs';
 import { CallRecording, Lead } from '../../models';
 import { linkFollowUpsToRecording } from '../../utils/linkFollowUpRecording';
 import { env } from '../../config/env';
@@ -233,7 +233,7 @@ recordingsRouter.post(
   }
 );
 
-/** Stream a recording file (local disk storage — used when S3 is disabled). */
+/** Stream a recording file (local disk or redirect to S3). */
 recordingsRouter.get('/:recordingId/file', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const userId = req.user!.id;
@@ -246,10 +246,23 @@ recordingsRouter.get('/:recordingId/file', async (req: AuthRequest, res: Respons
       throw new AppError(403, 'You do not have access to this recording.');
     }
     if (recording.uploadStatus !== 'uploaded') {
-      throw new AppError(404, 'Recording not available.');
+      throw new AppError(404, 'Recording not available yet (still uploading).');
+    }
+
+    // Object lives in S3 / object storage — redirect to a fresh signed URL.
+    if (env.S3_ENABLED && recording.s3Bucket !== 'local') {
+      const { url } = await getPresignedUrl(recording.s3Key);
+      return res.redirect(302, url);
     }
 
     const filePath = resolveLocalRecordingPath(recording.s3Key);
+    if (!existsSync(filePath)) {
+      throw new AppError(
+        404,
+        'Recording file missing on server. It may have been deleted or never saved to disk.'
+      );
+    }
+
     res.setHeader('Content-Type', recording.mimeType || 'audio/mp4');
     res.setHeader('Accept-Ranges', 'bytes');
     createReadStream(filePath).pipe(res);
@@ -280,7 +293,7 @@ recordingsRouter.get('/:recordingId', async (req: AuthRequest, res: Response, ne
 
     if (!env.S3_ENABLED || recording.s3Bucket === 'local') {
       return res.json({
-        url: `${env.API_BASE_URL}/api/recordings/${recordingId}/file`,
+        url: `recordings/${recordingId}/file`,
         expires_at: null,
       });
     }

@@ -19,6 +19,43 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function dayOnly(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+/** Overdue or due today — must be dialed before fresh remaining leads. */
+function hasCompulsoryFollowUp(nextFollowupDate: Date | string | null | undefined): boolean {
+  if (!nextFollowupDate) return false;
+  const raw = nextFollowupDate instanceof Date ? nextFollowupDate : new Date(nextFollowupDate);
+  if (Number.isNaN(raw.getTime())) return false;
+  const day = dayOnly(raw);
+  const today = dayOnly(new Date());
+  return day.getTime() <= today.getTime();
+}
+
+function followUpRank(lead: ILead): number {
+  if (!lead.nextFollowupDate) return 2;
+  const day = dayOnly(new Date(lead.nextFollowupDate));
+  const today = dayOnly(new Date());
+  if (day.getTime() < today.getTime()) return 0; // overdue
+  if (day.getTime() === today.getTime()) return 1; // today
+  return 2;
+}
+
+function compareRemaining(a: ILead, b: ILead): number {
+  const ra = followUpRank(a);
+  const rb = followUpRank(b);
+  if (ra !== rb) return ra - rb;
+  if ((ra === 0 || ra === 1) && a.nextFollowupDate && b.nextFollowupDate) {
+    const da = new Date(a.nextFollowupDate).getTime();
+    const db = new Date(b.nextFollowupDate).getTime();
+    if (da !== db) return da - db;
+  }
+  const na = (a.companyName || a.name || '').toLowerCase();
+  const nb = (b.companyName || b.name || '').toLowerCase();
+  return na.localeCompare(nb);
+}
+
 export function parseAgentLeadQuery(query: Record<string, unknown>): AgentLeadQuery {
   return {
     search: asString(query.search),
@@ -66,9 +103,18 @@ export function filterAgentLeadAssignments(
   }
 
   if (query.tab === 'called') {
-    filtered = filtered.filter((a) => (a.leadId.callCount ?? 0) > 0);
+    filtered = filtered.filter((a) => {
+      const lead = a.leadId;
+      const called = (lead.callCount ?? 0) > 0;
+      return called && !hasCompulsoryFollowUp(lead.nextFollowupDate);
+    });
   } else if (query.tab === 'remaining') {
-    filtered = filtered.filter((a) => (a.leadId.callCount ?? 0) === 0);
+    filtered = filtered.filter((a) => {
+      const lead = a.leadId;
+      const neverCalled = (lead.callCount ?? 0) === 0;
+      return neverCalled || hasCompulsoryFollowUp(lead.nextFollowupDate);
+    });
+    filtered.sort((a, b) => compareRemaining(a.leadId, b.leadId));
   }
 
   if (query.search) {

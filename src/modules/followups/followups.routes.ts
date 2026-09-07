@@ -16,6 +16,8 @@ const createFollowUpSchema = z.object({
   call_recording_id: z.string().optional(),
   call_outcome: z.string().optional(),
   next_followup_date: z.union([z.string(), z.null()]).optional(),
+  /** Client-measured seconds from form open to save (0–7200). */
+  form_fill_seconds: z.number().int().min(0).max(7200).optional(),
 });
 
 /** Scheduled follow-ups across all leads for the logged-in agent. */
@@ -98,6 +100,8 @@ export async function upsertLeadFollowUp(params: {
 
   const nextFollowupDate = parseOptionalDate(body.next_followup_date);
   const callOutcome = body.call_outcome?.trim() || 'unknown';
+  const formFillSeconds =
+    typeof body.form_fill_seconds === 'number' ? body.form_fill_seconds : undefined;
 
   const existing = await LeadFollowUp.findOne({ clientCallId: body.client_call_id });
 
@@ -106,6 +110,7 @@ export async function upsertLeadFollowUp(params: {
     existing.remarks = remarks;
     existing.nextFollowupDate = nextFollowupDate ?? undefined;
     existing.callOutcome = callOutcome;
+    if (formFillSeconds !== undefined) existing.formFillSeconds = formFillSeconds;
     if (callRecordingId) existing.callRecordingId = callRecordingId as unknown as ILeadFollowUp['callRecordingId'];
     await existing.save();
     followUp = existing;
@@ -121,6 +126,7 @@ export async function upsertLeadFollowUp(params: {
       remarks,
       callOutcome,
       nextFollowupDate: nextFollowupDate ?? undefined,
+      ...(formFillSeconds !== undefined ? { formFillSeconds } : {}),
       ...(callRecordingId ? { callRecordingId } : {}),
       sequenceNumber,
     });
@@ -169,6 +175,16 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
 
   if (latest) lead.lastContactDate = latest.createdAt;
   lead.nextFollowupDate = scheduled?.nextFollowupDate;
+
+  const withFill = followUps.filter(
+    (f) => typeof f.formFillSeconds === 'number' && (f.formFillSeconds as number) >= 0
+  );
+  if (withFill.length > 0) {
+    const last = withFill[withFill.length - 1];
+    lead.lastFormFillSeconds = last.formFillSeconds;
+    const sum = withFill.reduce((acc, f) => acc + (f.formFillSeconds ?? 0), 0);
+    lead.avgFormFillSeconds = Math.round(sum / withFill.length);
+  }
 
   await lead.save();
 }

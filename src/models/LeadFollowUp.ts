@@ -8,6 +8,8 @@ export interface ILeadFollowUp extends Document {
   remarks: string;
   nextFollowupDate?: Date;
   callOutcome?: string;
+  /** Seconds from form open to save (client-measured). */
+  formFillSeconds?: number;
   sequenceNumber: number;
   createdAt: Date;
   updatedAt: Date;
@@ -22,6 +24,7 @@ const leadFollowUpSchema = new Schema<ILeadFollowUp>(
     remarks: { type: String, required: true },
     nextFollowupDate: { type: Date },
     callOutcome: { type: String, default: 'unknown' },
+    formFillSeconds: { type: Number, min: 0 },
     sequenceNumber: { type: Number, required: true },
   },
   { timestamps: true }

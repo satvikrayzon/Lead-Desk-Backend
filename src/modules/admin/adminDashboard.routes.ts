@@ -44,7 +44,8 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
 
     const agentIds = agents.map((a) => a._id);
 
-    const [assignments, callsToday, callsWeek, followUpsWithNext] = await Promise.all([
+    const [assignments, callsToday, callsWeek, followUpsWithNext, formFillsToday, formFillsWeek] =
+      await Promise.all([
       LeadAssignment.find({ isActive: true }).select('leadId agentId'),
       CallRecording.find({ callStartTime: { $gte: todayStart } }).select(
         'agentId leadId durationSeconds'
@@ -53,6 +54,14 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         'agentId callStartTime durationSeconds'
       ),
       LeadFollowUp.find({ nextFollowupDate: { $ne: null, $lte: new Date() } }).select('leadId'),
+      LeadFollowUp.find({
+        createdAt: { $gte: todayStart },
+        formFillSeconds: { $ne: null, $gte: 0 },
+      }).select('agentId formFillSeconds'),
+      LeadFollowUp.find({
+        createdAt: { $gte: weekStart },
+        formFillSeconds: { $ne: null, $gte: 0 },
+      }).select('agentId formFillSeconds'),
     ]);
 
     const leadIds = [...new Set(assignments.map((a) => a.leadId.toString()))];
@@ -109,6 +118,34 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       }
     }
 
+    function avgFill(rows: { agentId: { toString(): string }; formFillSeconds?: number }[]) {
+      const sumBy = new Map<string, { sum: number; count: number }>();
+      let totalSum = 0;
+      let totalCount = 0;
+      for (const f of rows) {
+        const secs = Math.max(0, f.formFillSeconds ?? 0);
+        const aid = f.agentId.toString();
+        const cur = sumBy.get(aid) ?? { sum: 0, count: 0 };
+        cur.sum += secs;
+        cur.count += 1;
+        sumBy.set(aid, cur);
+        totalSum += secs;
+        totalCount += 1;
+      }
+      const avgBy = new Map<string, number>();
+      for (const [id, v] of sumBy) {
+        avgBy.set(id, v.count > 0 ? Math.round(v.sum / v.count) : 0);
+      }
+      return {
+        companyAvg: totalCount > 0 ? Math.round(totalSum / totalCount) : 0,
+        count: totalCount,
+        avgBy,
+      };
+    }
+
+    const fillToday = avgFill(formFillsToday);
+    const fillWeek = avgFill(formFillsWeek);
+
     const telecallers = agents.map((a) => {
       const id = a._id.toString();
       return {
@@ -124,6 +161,8 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         calls_last_7_days: callsWeekByAgent.get(id) ?? 0,
         talk_seconds_today: talkTodayByAgent.get(id) ?? 0,
         talk_seconds_last_7_days: talkWeekByAgent.get(id) ?? 0,
+        avg_form_fill_seconds_today: fillToday.avgBy.get(id) ?? 0,
+        avg_form_fill_seconds_last_7_days: fillWeek.avgBy.get(id) ?? 0,
       };
     });
 
@@ -137,6 +176,10 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
           calls_last_7_days: callsWeek.length,
           talk_seconds_today: talkSecondsToday,
           talk_seconds_last_7_days: talkSecondsWeek,
+          avg_form_fill_seconds_today: fillToday.companyAvg,
+          avg_form_fill_seconds_last_7_days: fillWeek.companyAvg,
+          form_fills_today: fillToday.count,
+          form_fills_last_7_days: fillWeek.count,
         },
         calls_by_day: Object.entries(dayBuckets).map(([date, v]) => ({
           date,

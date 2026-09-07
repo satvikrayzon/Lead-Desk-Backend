@@ -732,7 +732,7 @@ leadsRouter.get('/:leadId/calls', async (req: AuthRequest, res: Response, next: 
             const presigned = await getPresignedUrl(rec.s3Key);
             recordingUrl = presigned.url;
           } else {
-            recordingUrl = `${env.API_BASE_URL}/api/recordings/${rec._id.toString()}/file`;
+            recordingUrl = `recordings/${rec._id.toString()}/file`;
           }
         }
 

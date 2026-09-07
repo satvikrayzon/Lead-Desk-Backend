@@ -24,6 +24,7 @@ export interface FollowUpResponse {
   call_outcome: string;
   remarks: string;
   next_followup_date: string | null;
+  form_fill_seconds: number | null;
   sequence_number: number;
   created_at: string;
   call: FollowUpCallPayload | null;
@@ -38,7 +39,9 @@ export async function formatRecordingPayload(
       const presigned = await getPresignedUrl(recording.s3Key);
       recordingUrl = presigned.url;
     } else {
-      recordingUrl = `${env.API_BASE_URL}/api/recordings/${recording._id.toString()}/file`;
+      // Relative to /api — clients prepend their configured apiBaseUrl so
+      // playback works even when server API_BASE_URL is an internal LAN IP.
+      recordingUrl = `recordings/${recording._id.toString()}/file`;
     }
   }
 
@@ -70,6 +73,8 @@ export async function formatFollowUp(
     call_outcome: followUp.callOutcome ?? recording?.callOutcome ?? 'unknown',
     remarks: followUp.remarks,
     next_followup_date: followUp.nextFollowupDate?.toISOString() ?? null,
+    form_fill_seconds:
+      typeof followUp.formFillSeconds === 'number' ? followUp.formFillSeconds : null,
     sequence_number: followUp.sequenceNumber ?? 1,
     created_at: followUp.createdAt.toISOString(),
     call,
