@@ -22,7 +22,7 @@ class RemoteCallHttpHub {
     let set = map.get(agentId);
     if (!set) {
       set = new Set();
-      map.set(agentId, set);k
+      map.set(agentId, set);
     }
     return set;
   }
