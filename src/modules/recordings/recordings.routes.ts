@@ -15,6 +15,7 @@ import {
 } from '../../utils/helpers';
 import { saveLocalRecording, resolveLocalRecordingPath } from '../../services/localRecordingStore';
 import { RecordingSource } from '../../types/enums';
+import { notifyRecordingReady } from '../../services/realtimeNotify';
 
 export const recordingsRouter = Router();
 recordingsRouter.post(
@@ -159,6 +160,16 @@ recordingsRouter.post(
             phoneNumber: phone_number,
           });
           if (dup) {
+            notifyRecordingReady({
+              recordingId: dup._id.toString(),
+              leadId: lead_id,
+              agentId: userId,
+              phoneNumber: phone_number,
+              clientCallId: client_call_id || null,
+              callStartTime: callStartTime.toISOString(),
+              callEndTime: (dup.callEndTime || callEndTime).toISOString(),
+              durationSeconds: dup.durationSeconds ?? durationSeconds,
+            });
             return res.json({
               recording_id: dup._id.toString(),
               id: dup._id.toString(),
@@ -192,6 +203,17 @@ recordingsRouter.post(
           fileSizeBytes: req.file.size,
         },
         ipAddress: req.ip,
+      });
+
+      notifyRecordingReady({
+        recordingId: recording._id.toString(),
+        leadId: lead_id,
+        agentId: userId,
+        phoneNumber: phone_number,
+        clientCallId: client_call_id || null,
+        callStartTime: callStartTime.toISOString(),
+        callEndTime: callEndTime.toISOString(),
+        durationSeconds,
       });
 
       res.json({

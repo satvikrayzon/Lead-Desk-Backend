@@ -46,8 +46,12 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
 
     const [assignments, callsToday, callsWeek, followUpsWithNext] = await Promise.all([
       LeadAssignment.find({ isActive: true }).select('leadId agentId'),
-      CallRecording.find({ callStartTime: { $gte: todayStart } }).select('agentId leadId'),
-      CallRecording.find({ callStartTime: { $gte: weekStart } }).select('agentId callStartTime'),
+      CallRecording.find({ callStartTime: { $gte: todayStart } }).select(
+        'agentId leadId durationSeconds'
+      ),
+      CallRecording.find({ callStartTime: { $gte: weekStart } }).select(
+        'agentId callStartTime durationSeconds'
+      ),
       LeadFollowUp.find({ nextFollowupDate: { $ne: null, $lte: new Date() } }).select('leadId'),
     ]);
 
@@ -75,21 +79,34 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     }
 
     const callsTodayByAgent = new Map<string, number>();
+    const talkTodayByAgent = new Map<string, number>();
+    let talkSecondsToday = 0;
     for (const c of callsToday) {
       const aid = c.agentId.toString();
+      const secs = Math.max(0, c.durationSeconds || 0);
       callsTodayByAgent.set(aid, (callsTodayByAgent.get(aid) ?? 0) + 1);
+      talkTodayByAgent.set(aid, (talkTodayByAgent.get(aid) ?? 0) + secs);
+      talkSecondsToday += secs;
     }
 
     const callsWeekByAgent = new Map<string, number>();
-    const dayBuckets: Record<string, number> = {};
+    const talkWeekByAgent = new Map<string, number>();
+    const dayBuckets: Record<string, { count: number; talk_seconds: number }> = {};
     for (let i = 6; i >= 0; i--) {
-      dayBuckets[dateKey(daysAgo(i))] = 0;
+      dayBuckets[dateKey(daysAgo(i))] = { count: 0, talk_seconds: 0 };
     }
+    let talkSecondsWeek = 0;
     for (const c of callsWeek) {
       const aid = c.agentId.toString();
+      const secs = Math.max(0, c.durationSeconds || 0);
       callsWeekByAgent.set(aid, (callsWeekByAgent.get(aid) ?? 0) + 1);
+      talkWeekByAgent.set(aid, (talkWeekByAgent.get(aid) ?? 0) + secs);
+      talkSecondsWeek += secs;
       const key = dateKey(new Date(c.callStartTime));
-      if (key in dayBuckets) dayBuckets[key] += 1;
+      if (key in dayBuckets) {
+        dayBuckets[key].count += 1;
+        dayBuckets[key].talk_seconds += secs;
+      }
     }
 
     const telecallers = agents.map((a) => {
@@ -105,6 +122,8 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         pending_leads: pendingByAgent.get(id) ?? 0,
         calls_today: callsTodayByAgent.get(id) ?? 0,
         calls_last_7_days: callsWeekByAgent.get(id) ?? 0,
+        talk_seconds_today: talkTodayByAgent.get(id) ?? 0,
+        talk_seconds_last_7_days: talkWeekByAgent.get(id) ?? 0,
       };
     });
 
@@ -116,8 +135,14 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
           calls_today: callsToday.length,
           pending_leads: pendingLeadIds.size,
           calls_last_7_days: callsWeek.length,
+          talk_seconds_today: talkSecondsToday,
+          talk_seconds_last_7_days: talkSecondsWeek,
         },
-        calls_by_day: Object.entries(dayBuckets).map(([date, count]) => ({ date, count })),
+        calls_by_day: Object.entries(dayBuckets).map(([date, v]) => ({
+          date,
+          count: v.count,
+          talk_seconds: v.talk_seconds,
+        })),
         telecallers,
       },
     });
@@ -125,6 +150,77 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     next(err);
   }
 });
+
+/** Detailed daily report for one telecaller (calls + talk time). */
+adminDashboardRouter.get(
+  '/telecallers/:userId/daily',
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const userId = String(req.params.userId || '');
+      if (!Types.ObjectId.isValid(userId)) throw new AppError(400, 'Invalid user id.');
+
+      const dateRaw = String(req.query.date || dateKey(new Date()));
+      const parts = dateRaw.split('-').map((p) => Number(p));
+      if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) {
+        throw new AppError(400, 'date must be YYYY-MM-DD.');
+      }
+      const dayStart = new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0, 0);
+      const dayEnd = new Date(parts[0], parts[1] - 1, parts[2] + 1, 0, 0, 0, 0);
+
+      const user = await User.findById(userId).select('name email role teamName');
+      if (!user) throw new AppError(404, 'Telecaller not found.');
+
+      const calls = await CallRecording.find({
+        agentId: userId,
+        callStartTime: { $gte: dayStart, $lt: dayEnd },
+      })
+        .sort({ callStartTime: -1 })
+        .populate('leadId', 'companyName contactPerson contactMobile leadCode');
+
+      let talkSeconds = 0;
+      const rows = calls.map((c) => {
+        const secs = Math.max(0, c.durationSeconds || 0);
+        talkSeconds += secs;
+        const lead = c.leadId as unknown as {
+          _id?: { toString(): string };
+          companyName?: string;
+          contactPerson?: string;
+          contactMobile?: string;
+          leadCode?: string;
+        } | null;
+        return {
+          id: c._id.toString(),
+          lead_id: lead?._id?.toString() ?? c.leadId?.toString(),
+          company_name: lead?.companyName ?? '—',
+          contact_person: lead?.contactPerson ?? null,
+          phone_number: c.phoneNumber,
+          lead_code: lead?.leadCode ?? null,
+          call_start_time: c.callStartTime.toISOString(),
+          call_end_time: c.callEndTime.toISOString(),
+          duration_seconds: secs,
+          call_outcome: c.callOutcome ?? null,
+        };
+      });
+
+      res.json({
+        data: {
+          telecaller: {
+            id: user._id.toString(),
+            name: user.name,
+            email: user.email,
+            team_name: user.teamName ?? null,
+          },
+          date: dateKey(dayStart),
+          calls_count: rows.length,
+          talk_seconds: talkSeconds,
+          calls: rows,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 const transferSchema = z.object({
   lead_id: z.string().min(1),

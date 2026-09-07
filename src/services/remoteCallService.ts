@@ -187,8 +187,15 @@ export async function applyCallStatus(
   });
 
   if (TERMINAL.has(call.status) && status !== call.status) {
-    forwardStatus(io, input.agentId, payloadBase());
-    return { ok: true };
+    // Allow refining generic "ended" into a specific outcome from CallLog.
+    const canRefine =
+      call.status === 'ended' &&
+      status !== 'ended' &&
+      TERMINAL.has(status);
+    if (!canRefine) {
+      forwardStatus(io, input.agentId, payloadBase());
+      return { ok: true };
+    }
   }
 
   const now = input.timestamp ? new Date(input.timestamp) : new Date();
@@ -199,14 +206,20 @@ export async function applyCallStatus(
     call.answerTime = now;
   }
 
+  const neverConnected = status === 'busy' || status === 'rejected' || status === 'failed' || status === 'no_answer';
+  if (neverConnected) {
+    call.answerTime = undefined;
+    call.durationSeconds = 0;
+  }
+
   if (TERMINAL.has(status)) {
     call.endTime = now;
-    if (call.answerTime) {
+    if (call.answerTime && !neverConnected) {
       call.durationSeconds = Math.max(
         0,
         Math.floor((call.endTime.getTime() - call.answerTime.getTime()) / 1000)
       );
-    } else {
+    } else if (neverConnected) {
       call.durationSeconds = 0;
     }
     if (activeCallByAgent.get(input.agentId) === call.callId) {

@@ -13,6 +13,7 @@ import { healthRouter } from './modules/health/health.routes';
 import { adminRouter } from './modules/admin/admin.routes';
 import { followUpsRouter } from './modules/followups/followups.routes';
 import { remoteCallsRouter } from './modules/remote-calls/remoteCalls.routes';
+import { companySettingsRouter } from './modules/settings/companySettings.routes';
 
 export function createApp() {
   const app = express();
@@ -40,6 +41,7 @@ export function createApp() {
   app.use('/api/leads', authenticate, leadsRouter);
   app.use('/api/recordings', authenticate, recordingsRouter);
   app.use('/api/follow-ups', authenticate, followUpsRouter);
+  app.use('/api/company-settings', authenticate, companySettingsRouter);
   app.use('/api/admin', authenticate, adminRouter);
 
   app.use(notFoundHandler);

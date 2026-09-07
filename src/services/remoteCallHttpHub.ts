@@ -22,7 +22,7 @@ class RemoteCallHttpHub {
     let set = map.get(agentId);
     if (!set) {
       set = new Set();
-      map.set(agentId, set);
+      map.set(agentId, set);k
     }
     return set;
   }
@@ -164,6 +164,11 @@ class RemoteCallHttpHub {
   broadcastStatus(agentId: string, payload: Record<string, unknown>) {
     this.broadcast(agentId, 'windows', 'call:status', payload);
     this.broadcast(agentId, 'android', 'call:status', payload);
+  }
+
+  broadcastEvent(agentId: string, event: string, payload: Record<string, unknown>) {
+    this.broadcast(agentId, 'windows', event, payload);
+    this.broadcast(agentId, 'android', event, payload);
   }
 
   private broadcast(agentId: string, role: SseRole, event: string, data: unknown) {

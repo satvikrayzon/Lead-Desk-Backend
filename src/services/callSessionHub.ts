@@ -72,6 +72,10 @@ export function subscribe(agentId: string, res: Response): void {
   }
 }
 
+export function broadcastToAgent(agentId: string, event: string, data: unknown): void {
+  broadcast(agentId, event, data);
+}
+
 function broadcast(agentId: string, event: string, data: unknown): void {
   const set = subscribersByAgent.get(agentId);
   if (!set) return;

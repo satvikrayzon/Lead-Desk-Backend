@@ -3,6 +3,7 @@ import { createApp } from './app';
 import { env } from './config/env';
 import { connectDatabase } from './config/database';
 import { createSocketServer } from './socket/remoteCallSocket';
+import { setSocketServer } from './services/realtimeNotify';
 
 const app = createApp();
 const httpServer = http.createServer(app);
@@ -10,7 +11,8 @@ const httpServer = http.createServer(app);
 async function start() {
   try {
     await connectDatabase();
-    createSocketServer(httpServer);
+    const io = createSocketServer(httpServer);
+    setSocketServer(io);
     httpServer.listen(env.PORT, () => {
       console.log(`Lead Recorder API running on port ${env.PORT} [${env.NODE_ENV}]`);
       console.log(`Health: ${env.API_BASE_URL}/health`);

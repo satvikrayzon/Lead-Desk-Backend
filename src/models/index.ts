@@ -8,3 +8,4 @@ export { AuditLog } from './AuditLog';
 export { LeadImportBatch } from './LeadImportBatch';
 export { RemoteCall } from './RemoteCall';
 export { AgentDevice } from './AgentDevice';
+export { CompanySettings } from './CompanySettings';
