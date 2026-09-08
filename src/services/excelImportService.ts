@@ -3,18 +3,50 @@ import { Lead, LeadAssignment, LeadImportBatch } from '../models';
 import { ImportErrorRow } from '../models/LeadImportBatch';
 
 const HEADER_MAP: Record<string, string> = {
+  // State / location
   state: 'state',
   district: 'district',
+  city: 'city',
+
+  // Vendor / company identity
   vendorid: 'vendorId',
+  vendorcode: 'vendorId',
+  vendorno: 'vendorId',
+  firmcode: 'vendorId',
   vendorname: 'companyName',
+  firmname: 'companyName',
+  companyname: 'companyName',
+  company: 'companyName',
+  firm: 'companyName',
+  name: 'companyName',
+
+  // Contact
   contactperson: 'contactPerson',
+  personname: 'contactPerson',
+  contactname: 'contactPerson',
   contactemail: 'contactEmail',
+  email: 'contactEmail',
+  emailid: 'contactEmail',
+  mail: 'contactEmail',
   contactmobile: 'contactMobile',
+  mobilenumber: 'contactMobile',
+  mobile: 'contactMobile',
+  phone: 'contactMobile',
+  phonenumber: 'contactMobile',
+  contactno: 'contactMobile',
+  contactnumber: 'contactMobile',
+  mobileno: 'contactMobile',
+  cellphone: 'contactMobile',
+
+  // Other vendor fields
   address: 'address',
   website: 'website',
   rating: 'rating',
   ratingcount: 'ratingCount',
   installedcapacitykwp: 'currentInstallationCapacityKw',
+  installedcapacity: 'currentInstallationCapacityKw',
+  capacitykwp: 'currentInstallationCapacityKw',
+  capacitykw: 'currentInstallationCapacityKw',
   installationscount: 'installationsCount',
 };
 
@@ -27,8 +59,23 @@ function normalizeHeader(text: unknown): string {
 function cellText(cell: ExcelJS.CellValue | null | undefined): string | null {
   if (cell == null) return null;
   if (typeof cell === 'object' && 'text' in cell && cell.text != null) return String(cell.text).trim();
+  if (typeof cell === 'object' && 'result' in cell && cell.result != null) {
+    return cellText(cell.result as ExcelJS.CellValue);
+  }
   if (cell instanceof Date) return cell.toISOString();
+  // Avoid scientific notation for phone-like numbers from Excel.
+  if (typeof cell === 'number' && Number.isFinite(cell) && Math.abs(cell) >= 1e9) {
+    return Math.round(cell).toString();
+  }
   return String(cell).trim();
+}
+
+function normalizeMobile(raw: string | null | undefined): string {
+  if (!raw) return '';
+  // Keep leading +, strip spaces/dashes/parens; leave digits.
+  const cleaned = raw.replace(/[^\d+]/g, '');
+  if (cleaned.startsWith('+')) return cleaned;
+  return cleaned.replace(/\D/g, '');
 }
 
 function cellNumber(cell: ExcelJS.CellValue | null | undefined): number | null {
@@ -60,7 +107,15 @@ export async function importLeadsFromBuffer(params: {
 
   if (Object.keys(columnIndexToField).length === 0) {
     throw new Error(
-      'Could not recognize any columns. Expected headers like "Vendor Name", "Contact Mobile", "State", "District", etc.',
+      'Could not recognize any columns. Expected headers like "Firm Name" / "Vendor Name", "Mobile Number" / "Contact Mobile", "District", "Vendor Code", etc.',
+    );
+  }
+
+  const mappedFields = new Set(Object.values(columnIndexToField));
+  if (!mappedFields.has('companyName') && !mappedFields.has('contactMobile')) {
+    throw new Error(
+      'Excel headers were found, but no firm/vendor name or mobile column was recognized. ' +
+        'Use columns like "Firm Name" / "Vendor Name" and "Mobile Number" / "Contact Mobile".',
     );
   }
 
@@ -93,14 +148,14 @@ export async function importLeadsFromBuffer(params: {
       }
 
       const companyName = (record.companyName as string) || (record.contactPerson as string) || '';
-      const contactMobile = (record.contactMobile as string) || '';
+      const contactMobile = normalizeMobile(record.contactMobile as string | null | undefined);
 
       if (!companyName && !contactMobile) {
         totalRows -= 1;
         continue;
       }
       if (!contactMobile) {
-        throw new Error('Missing Contact Mobile.');
+        throw new Error('Missing Contact Mobile / Mobile Number.');
       }
 
       if (record.vendorId) {
@@ -110,6 +165,9 @@ export async function importLeadsFromBuffer(params: {
           continue;
         }
       }
+
+      const district = record.district ? String(record.district) : undefined;
+      const city = record.city ? String(record.city) : district;
 
       const lead = await Lead.create({
         vendorId: record.vendorId ? String(record.vendorId) : undefined,
@@ -124,7 +182,8 @@ export async function importLeadsFromBuffer(params: {
         currentInstallationCapacityKw: record.currentInstallationCapacityKw as number | undefined,
         installationsCount: record.installationsCount as number | undefined,
         state: record.state ? String(record.state) : undefined,
-        district: record.district ? String(record.district) : undefined,
+        district,
+        city,
         name: (record.contactPerson as string) || companyName || 'Unknown',
         phoneNumber: contactMobile,
         company: companyName || undefined,

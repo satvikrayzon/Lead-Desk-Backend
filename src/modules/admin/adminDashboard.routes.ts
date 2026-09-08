@@ -29,11 +29,51 @@ function dateKey(d: Date) {
   return `${y}-${m}-${day}`;
 }
 
-/** Company-wide dashboard: summary + per-telecaller report + 7-day call trend. */
+/** Parse YYYY-MM-DD as local calendar day start; falls back to null. */
+function parseDayStart(raw: unknown): Date | null {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const parts = raw.trim().split('-').map((p) => Number(p));
+  if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) return null;
+  return new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0, 0);
+}
+
+function endOfDayExclusive(dayStart: Date) {
+  const d = new Date(dayStart);
+  d.setDate(d.getDate() + 1);
+  return d;
+}
+
+function normalizeOutcome(raw: string | undefined | null): string {
+  const v = (raw || 'unknown').trim();
+  if (v === 'not_pickup') return 'notPickup';
+  if (v === 'not_connected') return 'notConnected';
+  return v || 'unknown';
+}
+
+function refId(ref: unknown): string {
+  if (ref == null) return '';
+  if (typeof ref === 'object' && ref !== null && '_id' in (ref as object)) {
+    return String((ref as { _id: unknown })._id);
+  }
+  return String(ref);
+}
+
+/** Company-wide dashboard: summary + insights + per-telecaller report. */
 adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const todayStart = startOfDay();
-    const weekStart = daysAgo(6);
+    const tomorrowStart = endOfDayExclusive(todayStart);
+
+    // Range for chart / outcomes / leaderboard / coverage (default last 7 days).
+    const daysRaw = Number(req.query.days ?? 7);
+    const days = [1, 7, 14, 30].includes(daysRaw) ? daysRaw : 7;
+    const fromQuery = parseDayStart(req.query.from);
+    const toQuery = parseDayStart(req.query.to);
+    const rangeStart = fromQuery ?? daysAgo(days - 1);
+    const rangeEndExclusive = toQuery ? endOfDayExclusive(toQuery) : endOfDayExclusive(todayStart);
+    if (rangeEndExclusive <= rangeStart) {
+      throw new AppError(400, 'Invalid date range.');
+    }
 
     const agents = await User.find({
       role: { $in: ['agent', 'manager'] },
@@ -42,26 +82,43 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       .select('name email role teamId teamName')
       .sort({ name: 1 });
 
-    const agentIds = agents.map((a) => a._id);
-
-    const [assignments, callsToday, callsWeek, followUpsWithNext, formFillsToday, formFillsWeek] =
-      await Promise.all([
+    const [
+      assignments,
+      callsToday,
+      callsRange,
+      overdueFollowUps,
+      dueTodayFollowUps,
+      formFillsToday,
+      formFillsRange,
+      followUpsRange,
+    ] = await Promise.all([
       LeadAssignment.find({ isActive: true }).select('leadId agentId'),
-      CallRecording.find({ callStartTime: { $gte: todayStart } }).select(
-        'agentId leadId durationSeconds'
+      CallRecording.find({ callStartTime: { $gte: todayStart, $lt: tomorrowStart } }).select(
+        'agentId leadId durationSeconds callOutcome uploadStatus'
       ),
-      CallRecording.find({ callStartTime: { $gte: weekStart } }).select(
-        'agentId callStartTime durationSeconds'
-      ),
-      LeadFollowUp.find({ nextFollowupDate: { $ne: null, $lte: new Date() } }).select('leadId'),
+      CallRecording.find({
+        callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
+      }).select('agentId leadId callStartTime durationSeconds callOutcome uploadStatus'),
+      LeadFollowUp.find({ nextFollowupDate: { $ne: null, $lt: todayStart } })
+        .select('leadId agentId nextFollowupDate remarks sequenceNumber')
+        .sort({ nextFollowupDate: 1 })
+        .limit(40)
+        .populate('leadId', 'companyName contactPerson contactMobile leadCode leadStage')
+        .populate('agentId', 'name email teamName'),
       LeadFollowUp.find({
-        createdAt: { $gte: todayStart },
+        nextFollowupDate: { $gte: todayStart, $lt: tomorrowStart },
+      }).select('leadId'),
+      LeadFollowUp.find({
+        createdAt: { $gte: todayStart, $lt: tomorrowStart },
         formFillSeconds: { $ne: null, $gte: 0 },
       }).select('agentId formFillSeconds'),
       LeadFollowUp.find({
-        createdAt: { $gte: weekStart },
+        createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
         formFillSeconds: { $ne: null, $gte: 0 },
       }).select('agentId formFillSeconds'),
+      LeadFollowUp.find({
+        createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
+      }).select('agentId'),
     ]);
 
     const leadIds = [...new Set(assignments.map((a) => a.leadId.toString()))];
@@ -69,12 +126,14 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       (await CallRecording.distinct('leadId', { leadId: { $in: leadIds } })).map((id) => id.toString())
     );
 
-    // Pending = assigned lead that has never been called, or overdue scheduled follow-up.
-    const overdueLeadIds = new Set(followUpsWithNext.map((f) => f.leadId.toString()));
+    const overdueLeadIds = new Set(overdueFollowUps.map((f) => refId(f.leadId)).filter(Boolean));
+    const dueTodayLeadIds = new Set(dueTodayFollowUps.map((f) => f.leadId.toString()));
     const pendingLeadIds = new Set<string>();
     for (const a of assignments) {
       const id = a.leadId.toString();
-      if (!calledLeadIds.has(id) || overdueLeadIds.has(id)) pendingLeadIds.add(id);
+      if (!calledLeadIds.has(id) || overdueLeadIds.has(id) || dueTodayLeadIds.has(id)) {
+        pendingLeadIds.add(id);
+      }
     }
 
     const assignedByAgent = new Map<string, number>();
@@ -98,24 +157,51 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       talkSecondsToday += secs;
     }
 
-    const callsWeekByAgent = new Map<string, number>();
-    const talkWeekByAgent = new Map<string, number>();
+    const callsRangeByAgent = new Map<string, number>();
+    const talkRangeByAgent = new Map<string, number>();
+    const followUpsRangeByAgent = new Map<string, number>();
     const dayBuckets: Record<string, { count: number; talk_seconds: number }> = {};
-    for (let i = 6; i >= 0; i--) {
-      dayBuckets[dateKey(daysAgo(i))] = { count: 0, talk_seconds: 0 };
+
+    // Fill day buckets for every calendar day in range (cap 62 days).
+    {
+      const cursor = new Date(rangeStart);
+      let guard = 0;
+      while (cursor < rangeEndExclusive && guard < 62) {
+        dayBuckets[dateKey(cursor)] = { count: 0, talk_seconds: 0 };
+        cursor.setDate(cursor.getDate() + 1);
+        guard += 1;
+      }
     }
-    let talkSecondsWeek = 0;
-    for (const c of callsWeek) {
+
+    let talkSecondsRange = 0;
+    const outcomeCounts = new Map<string, number>();
+    let connectedCalls = 0;
+    let recordingsUploaded = 0;
+
+    for (const c of callsRange) {
       const aid = c.agentId.toString();
       const secs = Math.max(0, c.durationSeconds || 0);
-      callsWeekByAgent.set(aid, (callsWeekByAgent.get(aid) ?? 0) + 1);
-      talkWeekByAgent.set(aid, (talkWeekByAgent.get(aid) ?? 0) + secs);
-      talkSecondsWeek += secs;
+      callsRangeByAgent.set(aid, (callsRangeByAgent.get(aid) ?? 0) + 1);
+      talkRangeByAgent.set(aid, (talkRangeByAgent.get(aid) ?? 0) + secs);
+      talkSecondsRange += secs;
       const key = dateKey(new Date(c.callStartTime));
       if (key in dayBuckets) {
         dayBuckets[key].count += 1;
         dayBuckets[key].talk_seconds += secs;
       }
+
+      const outcome = normalizeOutcome(c.callOutcome);
+      outcomeCounts.set(outcome, (outcomeCounts.get(outcome) ?? 0) + 1);
+
+      if (outcome === 'received') {
+        connectedCalls += 1;
+        if (c.uploadStatus === 'uploaded') recordingsUploaded += 1;
+      }
+    }
+
+    for (const f of followUpsRange) {
+      const aid = f.agentId.toString();
+      followUpsRangeByAgent.set(aid, (followUpsRangeByAgent.get(aid) ?? 0) + 1);
     }
 
     function avgFill(rows: { agentId: { toString(): string }; formFillSeconds?: number }[]) {
@@ -144,7 +230,7 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     }
 
     const fillToday = avgFill(formFillsToday);
-    const fillWeek = avgFill(formFillsWeek);
+    const fillRange = avgFill(formFillsRange);
 
     const telecallers = agents.map((a) => {
       const id = a._id.toString();
@@ -158,29 +244,134 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         assigned_leads: assignedByAgent.get(id) ?? 0,
         pending_leads: pendingByAgent.get(id) ?? 0,
         calls_today: callsTodayByAgent.get(id) ?? 0,
-        calls_last_7_days: callsWeekByAgent.get(id) ?? 0,
+        calls_last_7_days: callsRangeByAgent.get(id) ?? 0,
         talk_seconds_today: talkTodayByAgent.get(id) ?? 0,
-        talk_seconds_last_7_days: talkWeekByAgent.get(id) ?? 0,
+        talk_seconds_last_7_days: talkRangeByAgent.get(id) ?? 0,
         avg_form_fill_seconds_today: fillToday.avgBy.get(id) ?? 0,
-        avg_form_fill_seconds_last_7_days: fillWeek.avgBy.get(id) ?? 0,
+        avg_form_fill_seconds_last_7_days: fillRange.avgBy.get(id) ?? 0,
+        follow_ups_in_range: followUpsRangeByAgent.get(id) ?? 0,
+        idle_today: (assignedByAgent.get(id) ?? 0) > 0 && (callsTodayByAgent.get(id) ?? 0) === 0,
       };
     });
 
+    const idleTelecallersToday = telecallers.filter((t) => t.idle_today).length;
+    const recordingCoveragePercent =
+      connectedCalls > 0 ? Math.round((recordingsUploaded / connectedCalls) * 100) : 0;
+
+    const leaderboard = [...telecallers]
+      .map((t) => ({
+        id: t.id,
+        name: t.name,
+        team_name: t.team_name,
+        calls: t.calls_last_7_days,
+        talk_seconds: t.talk_seconds_last_7_days,
+        follow_ups: t.follow_ups_in_range,
+      }))
+      .sort((a, b) => {
+        if (b.calls !== a.calls) return b.calls - a.calls;
+        if (b.talk_seconds !== a.talk_seconds) return b.talk_seconds - a.talk_seconds;
+        return b.follow_ups - a.follow_ups;
+      })
+      .map((row, index) => ({ ...row, rank: index + 1 }));
+
+    const callOutcomes = [...outcomeCounts.entries()]
+      .map(([outcome, count]) => ({ outcome, count }))
+      .sort((a, b) => b.count - a.count);
+
+    const overdueList = overdueFollowUps
+      .filter((f) => f.leadId && f.agentId)
+      .map((f) => {
+        const lead = f.leadId as unknown as {
+          _id?: { toString(): string };
+          companyName?: string;
+          contactPerson?: string;
+          contactMobile?: string;
+          leadCode?: string;
+          leadStage?: string;
+        };
+        const agent = f.agentId as unknown as {
+          _id?: { toString(): string };
+          name?: string;
+          email?: string;
+          teamName?: string;
+        };
+        return {
+          id: f._id.toString(),
+          lead_id: refId(f.leadId),
+          company_name: lead?.companyName ?? '—',
+          contact_person: lead?.contactPerson ?? null,
+          contact_mobile: lead?.contactMobile ?? null,
+          lead_code: lead?.leadCode ?? null,
+          lead_stage: lead?.leadStage ?? null,
+          next_followup_date: f.nextFollowupDate?.toISOString() ?? null,
+          remarks: f.remarks ?? null,
+          sequence_number: f.sequenceNumber ?? 1,
+          agent_id: refId(f.agentId),
+          agent_name: agent?.name ?? '—',
+          agent_team_name: agent?.teamName ?? null,
+        };
+      });
+
+    const alerts: { type: string; message: string; count: number }[] = [];
+    if (overdueList.length > 0) {
+      alerts.push({
+        type: 'overdue_followups',
+        message: `${overdueLeadIds.size} overdue follow-up lead(s)`,
+        count: overdueLeadIds.size,
+      });
+    }
+    if (dueTodayFollowUps.length > 0) {
+      alerts.push({
+        type: 'due_today',
+        message: `${dueTodayFollowUps.length} follow-up(s) due today`,
+        count: dueTodayFollowUps.length,
+      });
+    }
+    if (idleTelecallersToday > 0) {
+      alerts.push({
+        type: 'idle_agents',
+        message: `${idleTelecallersToday} telecaller(s) idle today`,
+        count: idleTelecallersToday,
+      });
+    }
+    if (connectedCalls > 0 && recordingCoveragePercent < 80) {
+      alerts.push({
+        type: 'recording_coverage',
+        message: `Recording coverage ${recordingCoveragePercent}% (connected calls)`,
+        count: recordingCoveragePercent,
+      });
+    }
+
     res.json({
       data: {
+        range: {
+          from: dateKey(rangeStart),
+          to: dateKey(new Date(rangeEndExclusive.getTime() - 1)),
+          days,
+        },
         summary: {
           total_leads: leadIds.length,
           total_telecallers: agents.length,
           calls_today: callsToday.length,
           pending_leads: pendingLeadIds.size,
-          calls_last_7_days: callsWeek.length,
+          calls_last_7_days: callsRange.length,
           talk_seconds_today: talkSecondsToday,
-          talk_seconds_last_7_days: talkSecondsWeek,
+          talk_seconds_last_7_days: talkSecondsRange,
           avg_form_fill_seconds_today: fillToday.companyAvg,
-          avg_form_fill_seconds_last_7_days: fillWeek.companyAvg,
+          avg_form_fill_seconds_last_7_days: fillRange.companyAvg,
           form_fills_today: fillToday.count,
-          form_fills_last_7_days: fillWeek.count,
+          form_fills_last_7_days: fillRange.count,
+          overdue_followups: overdueLeadIds.size,
+          due_today_followups: dueTodayFollowUps.length,
+          connected_calls_in_range: connectedCalls,
+          recordings_uploaded_in_range: recordingsUploaded,
+          recording_coverage_percent: recordingCoveragePercent,
+          idle_telecallers_today: idleTelecallersToday,
         },
+        alerts,
+        call_outcomes: callOutcomes,
+        leaderboard,
+        overdue_followups: overdueList,
         calls_by_day: Object.entries(dayBuckets).map(([date, v]) => ({
           date,
           count: v.count,
