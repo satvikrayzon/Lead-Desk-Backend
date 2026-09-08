@@ -39,6 +39,7 @@ import { buildLeadTrackerWorkbook, loadFollowUpsByLeadId } from '../../services/
 import { getNextLeadCode } from '../../services/leadCodeService';
 
 import {
+  countAgentTabTotals,
   extractAgentFilterOptions,
   filterAgentLeadAssignments,
   parseAgentLeadQuery,
@@ -261,64 +262,59 @@ leadsRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction)
 
 
     const pageNum = Math.max(1, parseInt(page as string, 10) || 1);
-
-    const limitNum = Math.min(100, Math.max(1, parseInt(limit as string, 10) || 50));
-
+    const parsedLimit = parseInt(String(limit ?? ''), 10);
+    const limitNum = Math.min(100, Math.max(1, Number.isFinite(parsedLimit) ? parsedLimit : 30));
     const skip = (pageNum - 1) * limitNum;
-
-
 
     const agent = await User.findById(userId).select('name email teamName');
 
-
-
     const assignments = await LeadAssignment.find({
-
       agentId: userId,
-
       isActive: true,
-
     })
-
       .sort({ assignedAt: -1 })
-
       .populate<{ leadId: ILead }>('leadId');
 
-
-
+    const populated = assignments.map((a) => ({ leadId: a.leadId, assignedAt: a.assignedAt }));
     const listQuery = parseAgentLeadQuery(req.query as Record<string, unknown>);
 
-    let filtered = filterAgentLeadAssignments(
+    // Tab badge totals use the same filters/search, ignoring the selected tab.
+    const { remaining: remainingCount, called: calledCount } = countAgentTabTotals(populated, {
+      search: listQuery.search,
+      lead_status: listQuery.lead_status,
+      lead_stage: listQuery.lead_stage,
+      priority: listQuery.priority,
+      customer_type: listQuery.customer_type,
+      product: listQuery.product,
+      state: listQuery.state,
+      district: listQuery.district,
+      city: listQuery.city,
+    });
 
-      assignments.map((a) => ({ leadId: a.leadId, assignedAt: a.assignedAt })),
-
-      listQuery
-
-    );
-
-
+    let filtered = filterAgentLeadAssignments(populated, listQuery);
 
     if (status && typeof status === 'string') {
-
       if (!isValidLeadStatus(status)) {
-
         throw new AppError(400, 'Invalid status value.');
-
       }
-
       filtered = filtered.filter((a) => a.leadId.status === status);
-
     }
 
-
-
+    const total = filtered.length;
     const paged = filtered.slice(skip, skip + limitNum);
-
     const data = paged.map((a) => formatLead(a.leadId, a.assignedAt, agent));
 
-
-
-    res.json({ data });
+    res.json({
+      data,
+      meta: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        total_pages: Math.max(1, Math.ceil(total / limitNum)),
+        remaining_count: remainingCount,
+        called_count: calledCount,
+      },
+    });
 
   } catch (err) {
 

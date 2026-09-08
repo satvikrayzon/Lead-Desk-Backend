@@ -127,6 +127,7 @@ export function filterAgentLeadAssignments(
         (lead.companyName ?? '').toLowerCase().includes(term) ||
         (lead.company ?? '').toLowerCase().includes(term) ||
         (lead.contactPerson ?? '').toLowerCase().includes(term) ||
+        (lead.contactMobile ?? '').includes(query.search!) ||
         (lead.state ?? '').toLowerCase().includes(term) ||
         (lead.district ?? '').toLowerCase().includes(term) ||
         (lead.city ?? '').toLowerCase().includes(term)
@@ -135,6 +136,29 @@ export function filterAgentLeadAssignments(
   }
 
   return filtered;
+}
+
+export function isRemainingAssignment(lead: ILead): boolean {
+  const neverCalled = (lead.callCount ?? 0) === 0;
+  return neverCalled || hasCompulsoryFollowUp(lead.nextFollowupDate);
+}
+
+export function isCalledAssignment(lead: ILead): boolean {
+  return (lead.callCount ?? 0) > 0 && !hasCompulsoryFollowUp(lead.nextFollowupDate);
+}
+
+export function countAgentTabTotals(
+  assignments: PopulatedAssignment[],
+  query: Omit<AgentLeadQuery, 'tab'>
+): { remaining: number; called: number } {
+  const base = filterAgentLeadAssignments(assignments, { ...query, tab: undefined });
+  let remaining = 0;
+  let called = 0;
+  for (const a of base) {
+    if (isRemainingAssignment(a.leadId)) remaining += 1;
+    else if (isCalledAssignment(a.leadId)) called += 1;
+  }
+  return { remaining, called };
 }
 
 export function extractAgentFilterOptions(leads: ILead[]) {
