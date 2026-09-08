@@ -58,6 +58,9 @@ export const leadsRouter = Router();
 leadsRouter.post('/import', uploadExcel.single('file'), async (req: AuthRequest, res: Response, next: NextFunction) => {
 
   try {
+    // Large vendor sheets can take several minutes; avoid Node killing the socket early.
+    req.setTimeout(15 * 60 * 1000);
+    res.setTimeout(15 * 60 * 1000);
 
     if (!req.file) {
 

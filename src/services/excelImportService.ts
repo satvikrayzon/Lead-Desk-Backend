@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import { Types } from 'mongoose';
 import { Lead, LeadAssignment, LeadImportBatch } from '../models';
 import { ImportErrorRow } from '../models/LeadImportBatch';
 
@@ -50,6 +51,10 @@ const HEADER_MAP: Record<string, string> = {
   installationscount: 'installationsCount',
 };
 
+/** Insert chunk size — keeps memory and Mongo round-trips reasonable. */
+const INSERT_CHUNK_SIZE = 500;
+const MAX_STORED_ERRORS = 100;
+
 function normalizeHeader(text: unknown): string {
   return String(text || '')
     .toLowerCase()
@@ -72,7 +77,6 @@ function cellText(cell: ExcelJS.CellValue | null | undefined): string | null {
 
 function normalizeMobile(raw: string | null | undefined): string {
   if (!raw) return '';
-  // Keep leading +, strip spaces/dashes/parens; leave digits.
   const cleaned = raw.replace(/[^\d+]/g, '');
   if (cleaned.startsWith('+')) return cleaned;
   return cleaned.replace(/\D/g, '');
@@ -86,6 +90,11 @@ function cellNumber(cell: ExcelJS.CellValue | null | undefined): number | null {
 }
 
 type ImportRecord = Record<string, string | number | null | undefined>;
+
+type PreparedLead = {
+  rowNumber: number;
+  doc: Record<string, unknown>;
+};
 
 export async function importLeadsFromBuffer(params: {
   buffer: Buffer;
@@ -129,10 +138,23 @@ export async function importLeadsFromBuffer(params: {
     rowErrors: [],
   });
 
+  const assignTo = new Types.ObjectId(params.assignToUserId);
+  const uploadedBy = new Types.ObjectId(params.uploadedByUserId);
+
+  // ---- Pass 1: parse every data row (no DB calls) ----
   let totalRows = 0;
-  let createdCount = 0;
   let skippedCount = 0;
   const rowErrors: ImportErrorRow[] = [];
+  const prepared: PreparedLead[] = [];
+  const vendorIdsInFile: string[] = [];
+  const seenVendorIds = new Set<string>();
+  let sheetSequence = 0;
+
+  const pushError = (row: number, message: string) => {
+    if (rowErrors.length < MAX_STORED_ERRORS) {
+      rowErrors.push({ row, message });
+    }
+  };
 
   for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber += 1) {
     const row = sheet.getRow(rowNumber);
@@ -143,7 +165,12 @@ export async function importLeadsFromBuffer(params: {
       const record: ImportRecord = {};
       for (const [colIndex, field] of Object.entries(columnIndexToField)) {
         const cell = row.getCell(Number(colIndex)).value;
-        const isNumeric = ['rating', 'ratingCount', 'currentInstallationCapacityKw', 'installationsCount'].includes(field);
+        const isNumeric = [
+          'rating',
+          'ratingCount',
+          'currentInstallationCapacityKw',
+          'installationsCount',
+        ].includes(field);
         record[field] = isNumeric ? cellNumber(cell) : cellText(cell);
       }
 
@@ -158,58 +185,142 @@ export async function importLeadsFromBuffer(params: {
         throw new Error('Missing Contact Mobile / Mobile Number.');
       }
 
-      if (record.vendorId) {
-        const existing = await Lead.findOne({ vendorId: String(record.vendorId) });
-        if (existing) {
+      const vendorId = record.vendorId ? String(record.vendorId).trim() : '';
+      if (vendorId) {
+        if (seenVendorIds.has(vendorId)) {
           skippedCount += 1;
           continue;
         }
+        seenVendorIds.add(vendorId);
+        vendorIdsInFile.push(vendorId);
       }
 
       const district = record.district ? String(record.district) : undefined;
       const city = record.city ? String(record.city) : district;
+      sheetSequence += 1;
 
-      const lead = await Lead.create({
-        vendorId: record.vendorId ? String(record.vendorId) : undefined,
-        companyName: companyName || 'Unknown Vendor',
-        contactPerson: record.contactPerson ? String(record.contactPerson) : undefined,
-        contactEmail: record.contactEmail ? String(record.contactEmail) : undefined,
-        contactMobile,
-        address: record.address ? String(record.address) : undefined,
-        website: record.website ? String(record.website) : undefined,
-        rating: record.rating as number | undefined,
-        ratingCount: record.ratingCount as number | undefined,
-        currentInstallationCapacityKw: record.currentInstallationCapacityKw as number | undefined,
-        installationsCount: record.installationsCount as number | undefined,
-        state: record.state ? String(record.state) : undefined,
-        district,
-        city,
-        name: (record.contactPerson as string) || companyName || 'Unknown',
-        phoneNumber: contactMobile,
-        company: companyName || undefined,
-        importBatchId: batch._id,
-        leadStatus: 'open',
-        leadStage: 'not_contacted',
-        callCount: 0,
+      prepared.push({
+        rowNumber,
+        doc: {
+          vendorId: vendorId || undefined,
+          companyName: companyName || 'Unknown Vendor',
+          contactPerson: record.contactPerson ? String(record.contactPerson) : undefined,
+          contactEmail: record.contactEmail ? String(record.contactEmail) : undefined,
+          contactMobile,
+          address: record.address ? String(record.address) : undefined,
+          website: record.website ? String(record.website) : undefined,
+          rating: record.rating as number | undefined,
+          ratingCount: record.ratingCount as number | undefined,
+          currentInstallationCapacityKw: record.currentInstallationCapacityKw as number | undefined,
+          installationsCount: record.installationsCount as number | undefined,
+          state: record.state ? String(record.state) : undefined,
+          district,
+          city,
+          name: (record.contactPerson as string) || companyName || 'Unknown',
+          phoneNumber: contactMobile,
+          company: companyName || undefined,
+          importBatchId: batch._id,
+          importRowNumber: sheetSequence,
+          leadStatus: 'open',
+          leadStage: 'not_contacted',
+          callCount: 0,
+        },
       });
-
-      await LeadAssignment.create({
-        leadId: lead._id,
-        agentId: params.assignToUserId,
-        assignedBy: params.uploadedByUserId,
-        isActive: true,
-      });
-
-      createdCount += 1;
     } catch (err) {
-      rowErrors.push({ row: rowNumber, message: err instanceof Error ? err.message : 'Import failed.' });
+      pushError(rowNumber, err instanceof Error ? err.message : 'Import failed.');
     }
   }
 
+  // ---- Pass 2: one query for existing vendor IDs ----
+  const existingVendorIds = new Set<string>();
+  if (vendorIdsInFile.length > 0) {
+    for (let i = 0; i < vendorIdsInFile.length; i += INSERT_CHUNK_SIZE) {
+      const slice = vendorIdsInFile.slice(i, i + INSERT_CHUNK_SIZE);
+      const found = await Lead.find({ vendorId: { $in: slice } }).select('vendorId').lean();
+      for (const doc of found) {
+        if (doc.vendorId) existingVendorIds.add(String(doc.vendorId));
+      }
+    }
+  }
+
+  const toInsert = prepared.filter((item) => {
+    const vid = item.doc.vendorId ? String(item.doc.vendorId) : '';
+    if (vid && existingVendorIds.has(vid)) {
+      skippedCount += 1;
+      return false;
+    }
+    return true;
+  });
+
+  // ---- Pass 3: bulk insert leads + assignments ----
+  let createdCount = 0;
+  for (let i = 0; i < toInsert.length; i += INSERT_CHUNK_SIZE) {
+    const chunk = toInsert.slice(i, i + INSERT_CHUNK_SIZE);
+    try {
+      const inserted = await Lead.insertMany(
+        chunk.map((c) => c.doc),
+        { ordered: false },
+      );
+      createdCount += inserted.length;
+
+      if (inserted.length > 0) {
+        await LeadAssignment.insertMany(
+          inserted.map((lead) => ({
+            leadId: lead._id,
+            agentId: assignTo,
+            assignedBy: uploadedBy,
+            isActive: true,
+            assignedAt: new Date(),
+          })),
+          { ordered: false },
+        );
+      }
+    } catch (err: unknown) {
+      // ordered:false may still throw AggregateError / BulkWriteError after partial success
+      const anyErr = err as {
+        insertedDocs?: { _id: Types.ObjectId }[];
+        result?: { nInserted?: number };
+        writeErrors?: { index: number; errmsg?: string }[];
+        message?: string;
+      };
+
+      const insertedDocs = anyErr.insertedDocs;
+      if (Array.isArray(insertedDocs) && insertedDocs.length > 0) {
+        createdCount += insertedDocs.length;
+        try {
+          await LeadAssignment.insertMany(
+            insertedDocs.map((lead) => ({
+              leadId: lead._id,
+              agentId: assignTo,
+              assignedBy: uploadedBy,
+              isActive: true,
+              assignedAt: new Date(),
+            })),
+            { ordered: false },
+          );
+        } catch (_) {
+          // Assignments may partially fail; surface as row errors below.
+        }
+      } else if (typeof anyErr.result?.nInserted === 'number') {
+        createdCount += anyErr.result.nInserted;
+      }
+
+      if (Array.isArray(anyErr.writeErrors)) {
+        for (const we of anyErr.writeErrors) {
+          const src = chunk[we.index];
+          pushError(src?.rowNumber ?? 0, we.errmsg || 'Insert failed.');
+        }
+      } else {
+        pushError(chunk[0]?.rowNumber ?? 0, anyErr.message || 'Bulk insert failed.');
+      }
+    }
+  }
+
+  const errorCount = rowErrors.length;
   batch.totalRows = totalRows;
   batch.createdCount = createdCount;
   batch.skippedCount = skippedCount;
-  batch.errorCount = rowErrors.length;
+  batch.errorCount = errorCount;
   batch.rowErrors = rowErrors;
   await batch.save();
 

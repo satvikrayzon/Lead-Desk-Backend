@@ -42,18 +42,75 @@ function followUpRank(lead: ILead): number {
   return 2;
 }
 
-function compareRemaining(a: ILead, b: ILead): number {
-  const ra = followUpRank(a);
-  const rb = followUpRank(b);
+function newestTimestamp(a: PopulatedAssignment): number {
+  const assigned = a.assignedAt instanceof Date ? a.assignedAt.getTime() : 0;
+  const createdRaw = a.leadId.createdAt;
+  const created =
+    createdRaw instanceof Date
+      ? createdRaw.getTime()
+      : createdRaw
+        ? new Date(createdRaw).getTime()
+        : 0;
+  return Math.max(assigned || 0, created || 0);
+}
+
+/** Mongo ObjectId creation time — preserves bulk insert / Excel row order. */
+function leadInsertOrder(lead: ILead): number {
+  try {
+    const id = lead._id as { getTimestamp?: () => Date; toString?: () => string };
+    if (typeof id?.getTimestamp === 'function') {
+      return id.getTimestamp().getTime();
+    }
+    const hex = typeof id?.toString === 'function' ? id.toString() : String(lead._id);
+    if (/^[a-f0-9]{24}$/i.test(hex)) {
+      return parseInt(hex.slice(0, 8), 16) * 1000;
+    }
+  } catch {
+    // ignore
+  }
+  return 0;
+}
+
+/**
+ * Remaining list order (backend is source of truth for app list order):
+ * 1) Overdue / due-today follow-ups first
+ * 2) Newer import batches before older ones
+ * 3) Within a batch — Excel sheet order (1st row at top)
+ */
+function compareRemainingAssignments(a: PopulatedAssignment, b: PopulatedAssignment): number {
+  const ra = followUpRank(a.leadId);
+  const rb = followUpRank(b.leadId);
   if (ra !== rb) return ra - rb;
-  if ((ra === 0 || ra === 1) && a.nextFollowupDate && b.nextFollowupDate) {
-    const da = new Date(a.nextFollowupDate).getTime();
-    const db = new Date(b.nextFollowupDate).getTime();
+  if ((ra === 0 || ra === 1) && a.leadId.nextFollowupDate && b.leadId.nextFollowupDate) {
+    const da = new Date(a.leadId.nextFollowupDate).getTime();
+    const db = new Date(b.leadId.nextFollowupDate).getTime();
     if (da !== db) return da - db;
   }
-  const na = (a.companyName || a.name || '').toLowerCase();
-  const nb = (b.companyName || b.name || '').toLowerCase();
-  return na.localeCompare(nb);
+
+  const batchA = a.leadId.importBatchId?.toString() ?? '';
+  const batchB = b.leadId.importBatchId?.toString() ?? '';
+  if (batchA && batchB && batchA !== batchB) {
+    const ta = newestTimestamp(a);
+    const tb = newestTimestamp(b);
+    if (ta !== tb) return tb - ta; // newer import batch first
+  }
+
+  const rowA = a.leadId.importRowNumber;
+  const rowB = b.leadId.importRowNumber;
+  if (rowA != null && rowB != null && rowA !== rowB) return rowA - rowB;
+  if (rowA != null && rowB == null) return -1;
+  if (rowA == null && rowB != null) return 1;
+
+  // Already-imported sheets (no importRowNumber): ObjectId / created order ≈ Excel order
+  const ia = leadInsertOrder(a.leadId);
+  const ib = leadInsertOrder(b.leadId);
+  if (ia !== ib) return ia - ib;
+  return newestTimestamp(a) - newestTimestamp(b);
+}
+
+/** Called tab: most recently assigned/created first. */
+function compareCalledAssignments(a: PopulatedAssignment, b: PopulatedAssignment): number {
+  return newestTimestamp(b) - newestTimestamp(a);
 }
 
 export function parseAgentLeadQuery(query: Record<string, unknown>): AgentLeadQuery {
@@ -114,7 +171,6 @@ export function filterAgentLeadAssignments(
       const neverCalled = (lead.callCount ?? 0) === 0;
       return neverCalled || hasCompulsoryFollowUp(lead.nextFollowupDate);
     });
-    filtered.sort((a, b) => compareRemaining(a.leadId, b.leadId));
   }
 
   if (query.search) {
@@ -133,6 +189,12 @@ export function filterAgentLeadAssignments(
         (lead.city ?? '').toLowerCase().includes(term)
       );
     });
+  }
+
+  if (query.tab === 'remaining') {
+    filtered.sort(compareRemainingAssignments);
+  } else {
+    filtered.sort(compareCalledAssignments);
   }
 
   return filtered;

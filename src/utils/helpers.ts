@@ -142,6 +142,10 @@ export interface LeadResponse {
 
   company: string | null;
 
+  import_batch_id: string | null;
+
+  import_row_number: number | null;
+
   created_at: string;
 
   updated_at: string;
@@ -319,6 +323,11 @@ export function formatLead(lead: ILead, assignedAt: Date, agent?: IUser | null):
     assigned_at: assignedAt.toISOString(),
 
     company: lead.company ?? companyName ?? null,
+
+    import_batch_id: lead.importBatchId?.toString() ?? null,
+
+    import_row_number:
+      typeof lead.importRowNumber === 'number' ? lead.importRowNumber : null,
 
     created_at: lead.createdAt.toISOString(),
 

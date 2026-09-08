@@ -50,7 +50,8 @@ export interface ILead extends Document {
 
   importBatchId?: mongoose.Types.ObjectId;
 
-
+  /** 1-based row order from the source Excel (first data row = 1). */
+  importRowNumber?: number;
 
   // Tracker identity (Sales_Lead_Tracker Lead_Data)
 
@@ -195,8 +196,7 @@ const leadSchema = new Schema<ILead>(
     lastCalledAt: { type: Date },
 
     importBatchId: { type: Schema.Types.ObjectId, ref: 'LeadImportBatch' },
-
-
+    importRowNumber: { type: Number, index: true },
 
     leadCode: { type: String, index: true, sparse: true },
 
