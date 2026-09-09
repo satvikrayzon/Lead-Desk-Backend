@@ -22,6 +22,7 @@ export interface FollowUpResponse {
   client_call_id: string;
   call_recording_id: string | null;
   call_outcome: string;
+  lead_result: string | null;
   remarks: string;
   next_followup_date: string | null;
   form_fill_seconds: number | null;
@@ -71,6 +72,7 @@ export async function formatFollowUp(
     client_call_id: followUp.clientCallId,
     call_recording_id: followUp.callRecordingId?.toString() ?? null,
     call_outcome: followUp.callOutcome ?? recording?.callOutcome ?? 'unknown',
+    lead_result: followUp.leadResult ?? null,
     remarks: followUp.remarks,
     next_followup_date: followUp.nextFollowupDate?.toISOString() ?? null,
     form_fill_seconds:

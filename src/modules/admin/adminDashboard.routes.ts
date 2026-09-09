@@ -6,6 +6,13 @@ import { AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { createAuditLog, formatLead } from '../../utils/helpers';
 import { toApiRole } from '../../utils/roleMapping';
+import {
+  buildAllDailySalesReports,
+  buildDailySalesReport,
+  buildDailySalesReportWorkbook,
+  formatDailySalesReportText,
+  parseReportRange,
+} from '../../services/dailySalesReportService';
 
 export const adminDashboardRouter = Router();
 
@@ -455,6 +462,96 @@ adminDashboardRouter.get(
     }
   }
 );
+
+/** Full Daily Sales Telecalling Report for one telecaller. */
+adminDashboardRouter.get(
+  '/telecallers/:userId/sales-report',
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const userId = String(req.params.userId || '');
+      if (!Types.ObjectId.isValid(userId)) throw new AppError(400, 'Invalid user id.');
+      const { rangeStart, rangeEndExclusive } = parseReportRange(req.query);
+      const report = await buildDailySalesReport(userId, rangeStart, rangeEndExclusive);
+      res.json({ data: report });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'Telecaller not found') {
+        return next(new AppError(404, err.message));
+      }
+      next(err);
+    }
+  }
+);
+
+/** Plain-text copy of one telecaller's daily sales report (WhatsApp-ready). */
+adminDashboardRouter.get(
+  '/telecallers/:userId/sales-report/text',
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const userId = String(req.params.userId || '');
+      if (!Types.ObjectId.isValid(userId)) throw new AppError(400, 'Invalid user id.');
+      const { rangeStart, rangeEndExclusive } = parseReportRange(req.query);
+      const report = await buildDailySalesReport(userId, rangeStart, rangeEndExclusive);
+      const text = formatDailySalesReportText(report);
+      res.type('text/plain; charset=utf-8').send(text);
+    } catch (err) {
+      if (err instanceof Error && err.message === 'Telecaller not found') {
+        return next(new AppError(404, err.message));
+      }
+      next(err);
+    }
+  }
+);
+
+/** Company-wide daily sales reports for all telecallers. */
+adminDashboardRouter.get('/sales-reports', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { rangeStart, rangeEndExclusive, fromKey, toKey } = parseReportRange(req.query);
+    const reports = await buildAllDailySalesReports(rangeStart, rangeEndExclusive);
+    res.json({
+      data: {
+        date: fromKey,
+        date_from: fromKey,
+        date_to: toKey,
+        date_display: reports[0]?.date_display ?? fromKey,
+        reports,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Excel export — one agent or all agents for the day. */
+adminDashboardRouter.get('/sales-reports/export', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { rangeStart, rangeEndExclusive, fromKey, toKey } = parseReportRange(req.query);
+    const userId = typeof req.query.user_id === 'string' ? req.query.user_id : '';
+    let reports;
+    if (userId) {
+      if (!Types.ObjectId.isValid(userId)) throw new AppError(400, 'Invalid user id.');
+      reports = [await buildDailySalesReport(userId, rangeStart, rangeEndExclusive)];
+    } else {
+      reports = await buildAllDailySalesReports(rangeStart, rangeEndExclusive);
+    }
+    const buffer = await buildDailySalesReportWorkbook(reports);
+    const stamp = fromKey === toKey ? fromKey.replace(/-/g, '') : `${fromKey.replace(/-/g, '')}_${toKey.replace(/-/g, '')}`;
+    const namePart = userId && reports[0] ? `_${reports[0].employee.name.replace(/\s+/g, '_')}` : '_All';
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="Daily_Sales_Report_${stamp}${namePart}.xlsx"`
+    );
+    res.send(buffer);
+  } catch (err) {
+    if (err instanceof Error && err.message === 'Telecaller not found') {
+      return next(new AppError(404, err.message));
+    }
+    next(err);
+  }
+});
 
 const transferSchema = z.object({
   lead_id: z.string().min(1),

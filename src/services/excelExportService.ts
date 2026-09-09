@@ -90,7 +90,14 @@ function outcomeLabel(outcome?: string | null): string {
     case 'not_connected':
       return 'Not connected';
     case 'busy':
-      return 'Busy';
+      return 'Busy / switched off';
+    case 'wrongNumber':
+    case 'wrong_number':
+      return 'Wrong number';
+    case 'decisionMakerConnected':
+    case 'decision_maker_connected':
+    case 'decision_maker':
+      return 'Decision maker';
     default:
       return outcome ? outcome : 'Unknown';
   }

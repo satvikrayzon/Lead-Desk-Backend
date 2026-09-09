@@ -180,10 +180,14 @@ recordingsRouter.post(
         throw new AppError(500, 'Failed to store recording.');
       }
 
-      // Bump lead call stats for the Called tab.
+      // Bump lead call stats for the Called tab (don't double-count if follow-up already did).
+      const leadForStats = await Lead.findById(lead_id).select('callCount');
+      const recordingCount = await CallRecording.countDocuments({ leadId: lead_id });
       await Lead.findByIdAndUpdate(lead_id, {
-        $inc: { callCount: 1 },
-        $set: { lastCalledAt: callEndTime },
+        $set: {
+          callCount: Math.max(leadForStats?.callCount ?? 0, recordingCount),
+          lastCalledAt: callEndTime,
+        },
       });
 
       if (client_call_id) {

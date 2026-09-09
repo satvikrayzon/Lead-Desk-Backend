@@ -15,6 +15,7 @@ const createFollowUpSchema = z.object({
   client_call_id: z.string().min(1),
   call_recording_id: z.string().optional(),
   call_outcome: z.string().optional(),
+  lead_result: z.string().optional(),
   next_followup_date: z.union([z.string(), z.null()]).optional(),
   /** Client-measured seconds from form open to save (0–7200). */
   form_fill_seconds: z.number().int().min(0).max(7200).optional(),
@@ -100,6 +101,7 @@ export async function upsertLeadFollowUp(params: {
 
   const nextFollowupDate = parseOptionalDate(body.next_followup_date);
   const callOutcome = body.call_outcome?.trim() || 'unknown';
+  const leadResult = body.lead_result?.trim() || undefined;
   const formFillSeconds =
     typeof body.form_fill_seconds === 'number' ? body.form_fill_seconds : undefined;
 
@@ -110,6 +112,7 @@ export async function upsertLeadFollowUp(params: {
     existing.remarks = remarks;
     existing.nextFollowupDate = nextFollowupDate ?? undefined;
     existing.callOutcome = callOutcome;
+    if (leadResult !== undefined) existing.leadResult = leadResult || undefined;
     if (formFillSeconds !== undefined) existing.formFillSeconds = formFillSeconds;
     if (callRecordingId) existing.callRecordingId = callRecordingId as unknown as ILeadFollowUp['callRecordingId'];
     await existing.save();
@@ -125,6 +128,7 @@ export async function upsertLeadFollowUp(params: {
       clientCallId: body.client_call_id,
       remarks,
       callOutcome,
+      ...(leadResult ? { leadResult } : {}),
       nextFollowupDate: nextFollowupDate ?? undefined,
       ...(formFillSeconds !== undefined ? { formFillSeconds } : {}),
       ...(callRecordingId ? { callRecordingId } : {}),
@@ -175,6 +179,14 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
 
   if (latest) lead.lastContactDate = latest.createdAt;
   lead.nextFollowupDate = scheduled?.nextFollowupDate;
+
+  // Keep Called-tab stats in sync even when no recording was uploaded (Windows CRM).
+  lead.callCount = Math.max(lead.callCount ?? 0, followUps.length);
+  if (latest) {
+    if (!lead.lastCalledAt || latest.createdAt >= lead.lastCalledAt) {
+      lead.lastCalledAt = latest.createdAt;
+    }
+  }
 
   const withFill = followUps.filter(
     (f) => typeof f.formFillSeconds === 'number' && (f.formFillSeconds as number) >= 0

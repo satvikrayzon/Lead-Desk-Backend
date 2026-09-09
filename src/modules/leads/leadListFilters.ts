@@ -160,17 +160,9 @@ export function filterAgentLeadAssignments(
   }
 
   if (query.tab === 'called') {
-    filtered = filtered.filter((a) => {
-      const lead = a.leadId;
-      const called = (lead.callCount ?? 0) > 0;
-      return called && !hasCompulsoryFollowUp(lead.nextFollowupDate);
-    });
+    filtered = filtered.filter((a) => isCalledAssignment(a.leadId));
   } else if (query.tab === 'remaining') {
-    filtered = filtered.filter((a) => {
-      const lead = a.leadId;
-      const neverCalled = (lead.callCount ?? 0) === 0;
-      return neverCalled || hasCompulsoryFollowUp(lead.nextFollowupDate);
-    });
+    filtered = filtered.filter((a) => isRemainingAssignment(a.leadId));
   }
 
   if (query.search) {
@@ -200,13 +192,23 @@ export function filterAgentLeadAssignments(
   return filtered;
 }
 
+/** True when the lead has been worked (call / follow-up / form), not raw import. */
+function hasBeenWorked(lead: ILead): boolean {
+  if ((lead.callCount ?? 0) > 0) return true;
+  if (lead.lastCalledAt) return true;
+  if (lead.lastContactDate) return true;
+  if (typeof lead.lastFormFillSeconds === 'number') return true;
+  if (typeof lead.avgFormFillSeconds === 'number' && lead.avgFormFillSeconds > 0) return true;
+  if (lead.followupRemarks && String(lead.followupRemarks).trim()) return true;
+  return false;
+}
+
 export function isRemainingAssignment(lead: ILead): boolean {
-  const neverCalled = (lead.callCount ?? 0) === 0;
-  return neverCalled || hasCompulsoryFollowUp(lead.nextFollowupDate);
+  return !hasBeenWorked(lead) || hasCompulsoryFollowUp(lead.nextFollowupDate);
 }
 
 export function isCalledAssignment(lead: ILead): boolean {
-  return (lead.callCount ?? 0) > 0 && !hasCompulsoryFollowUp(lead.nextFollowupDate);
+  return hasBeenWorked(lead) && !hasCompulsoryFollowUp(lead.nextFollowupDate);
 }
 
 export function countAgentTabTotals(

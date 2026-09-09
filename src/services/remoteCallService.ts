@@ -199,6 +199,7 @@ export async function applyCallStatus(
   }
 
   const now = input.timestamp ? new Date(input.timestamp) : new Date();
+  const previousStatus = call.status;
   call.status = status;
   if (input.error) call.lastError = input.error;
 
@@ -224,6 +225,14 @@ export async function applyCallStatus(
     }
     if (activeCallByAgent.get(input.agentId) === call.callId) {
       activeCallByAgent.delete(input.agentId);
+    }
+
+    // First time this remote call ends → count it on the lead (Windows CRM has no local call DB).
+    if (!TERMINAL.has(previousStatus)) {
+      await Lead.findByIdAndUpdate(call.leadId, {
+        $inc: { callCount: 1 },
+        $set: { lastCalledAt: call.endTime },
+      });
     }
   }
 
