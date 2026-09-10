@@ -736,6 +736,95 @@ adminDashboardRouter.post('/transfer-leads', async (req: AuthRequest, res: Respo
 });
 
 /** Pending leads list (optional filter by telecaller). */
+adminDashboardRouter.get('/follow-ups', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const agentId = typeof req.query.agent_id === 'string' ? req.query.agent_id.trim() : '';
+    const scope = typeof req.query.scope === 'string' ? req.query.scope.trim() : 'all';
+    // pending = overdue + due today (IST); all = every scheduled next date
+    const tomorrowStart = new Date(startOfDay().getTime() + 24 * 60 * 60 * 1000);
+
+    const activeAgents = await User.find({
+      role: { $in: ['agent', 'manager'] },
+      isActive: true,
+      ...(agentId && Types.ObjectId.isValid(agentId) ? { _id: new Types.ObjectId(agentId) } : {}),
+    })
+      .select('_id name teamName')
+      .lean();
+
+    const agentIds = activeAgents.map((a) => a._id);
+    if (agentIds.length === 0) {
+      res.json({ data: [], meta: { overdue_count: 0, due_today_count: 0, upcoming_count: 0 } });
+      return;
+    }
+
+    const dateFilter: Record<string, unknown> =
+      scope === 'pending'
+        ? { $ne: null, $lt: tomorrowStart }
+        : { $ne: null };
+
+    const followUps = await LeadFollowUp.find({
+      agentId: { $in: agentIds },
+      nextFollowupDate: dateFilter,
+    })
+      .sort({ nextFollowupDate: 1, createdAt: -1 })
+      .limit(1000)
+      .lean();
+
+    const leadIds = [...new Set(followUps.map((f) => f.leadId.toString()))];
+    const leads = leadIds.length
+      ? await Lead.find({ _id: { $in: leadIds } })
+          .select('companyName contactPerson contactMobile leadCode leadStage')
+          .lean()
+      : [];
+    const leadById = new Map(leads.map((l) => [l._id.toString(), l]));
+    const agentById = new Map(activeAgents.map((a) => [a._id.toString(), a]));
+
+    const todayStart = startOfDay();
+    let overdueCount = 0;
+    let dueTodayCount = 0;
+    let upcomingCount = 0;
+
+    const data = followUps.map((f) => {
+      const lead = leadById.get(f.leadId.toString());
+      const agent = agentById.get(f.agentId.toString());
+      const due = f.nextFollowupDate ? new Date(f.nextFollowupDate) : null;
+      if (due) {
+        if (due < todayStart) overdueCount += 1;
+        else if (due < tomorrowStart) dueTodayCount += 1;
+        else upcomingCount += 1;
+      }
+      return {
+        id: f._id.toString(),
+        lead_id: f.leadId.toString(),
+        company_name: lead?.companyName ?? '—',
+        contact_person: lead?.contactPerson ?? null,
+        contact_mobile: lead?.contactMobile ?? null,
+        lead_code: lead?.leadCode ?? null,
+        lead_stage: lead?.leadStage ?? null,
+        next_followup_date: f.nextFollowupDate?.toISOString() ?? null,
+        remarks: f.remarks ?? null,
+        sequence_number: f.sequenceNumber ?? 1,
+        agent_id: f.agentId.toString(),
+        agent_name: agent?.name ?? '—',
+        agent_team_name: agent?.teamName ?? null,
+      };
+    });
+
+    res.json({
+      data,
+      meta: {
+        overdue_count: overdueCount,
+        due_today_count: dueTodayCount,
+        upcoming_count: upcomingCount,
+        total: data.length,
+        scope: scope === 'pending' ? 'pending' : 'all',
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 adminDashboardRouter.get('/pending-leads', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const agentId = typeof req.query.agent_id === 'string' ? req.query.agent_id : null;
