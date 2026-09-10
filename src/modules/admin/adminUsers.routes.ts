@@ -7,6 +7,7 @@ import { createAuditLog } from '../../utils/helpers';
 import { hashPassword } from '../../utils/password';
 import { fromApiRole } from '../../utils/roleMapping';
 import { formatUser } from '../../utils/userFormat';
+import { wipeTelecallerTestData } from '../../services/wipeTelecallerService';
 
 export const adminUsersRouter = Router();
 
@@ -153,6 +154,45 @@ adminUsersRouter.delete('/:userId', async (req: AuthRequest, res: Response, next
 
     res.json({ data: { success: true } });
   } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Wipe test telecaller data: activity + assignments (+ orphan leads), then deactivate.
+ * Body: { confirm: true, delete_orphan_leads?: boolean }
+ */
+adminUsersRouter.post('/:userId/wipe-test-data', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const userId = String(req.params.userId || '');
+    if (userId === req.user!.id) {
+      throw new AppError(400, 'You cannot wipe your own account.');
+    }
+    const confirm = req.body?.confirm === true;
+    if (!confirm) {
+      throw new AppError(400, 'Pass { "confirm": true } to wipe this user.');
+    }
+    const deleteOrphanLeads = req.body?.delete_orphan_leads !== false;
+
+    const result = await wipeTelecallerTestData({ userId, deleteOrphanLeads });
+
+    await createAuditLog({
+      userId: req.user!.id,
+      action: 'admin.user.wipe_test_data',
+      entityType: 'user',
+      entityId: userId,
+      metadata: result as unknown as Record<string, unknown>,
+      ipAddress: req.ip,
+    });
+
+    res.json({ data: result });
+  } catch (err) {
+    if (err instanceof Error && err.message === 'User not found') {
+      return next(new AppError(404, err.message));
+    }
+    if (err instanceof Error && err.message === 'Invalid user id') {
+      return next(new AppError(400, err.message));
+    }
     next(err);
   }
 });

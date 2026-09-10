@@ -2,10 +2,12 @@ import { Router, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { Types } from 'mongoose';
 import { CallRecording, Lead, LeadAssignment, LeadFollowUp, User } from '../../models';
+import { ILead } from '../../models/Lead';
 import { AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { createAuditLog, formatLead } from '../../utils/helpers';
 import { toApiRole } from '../../utils/roleMapping';
+import { dateKeyIst, daysAgoIst, startOfIstDay } from '../../utils/istCalendar';
 import {
   buildAllDailySalesReports,
   buildDailySalesReport,
@@ -13,48 +15,50 @@ import {
   formatDailySalesReportText,
   parseReportRange,
 } from '../../services/dailySalesReportService';
-import { buildTelecallerPerformanceDashboard } from '../../services/telecallerPerformanceService';
+import {
+  buildTelecallerPerformanceDashboard,
+  loadCompanyDials,
+} from '../../services/telecallerPerformanceService';
+import { isRemainingAssignment } from '../leads/leadListFilters';
 
 export const adminDashboardRouter = Router();
 
 function startOfDay(d = new Date()) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
+  return startOfIstDay(d);
 }
 
 function daysAgo(n: number) {
-  const d = startOfDay();
-  d.setDate(d.getDate() - n);
-  return d;
+  return daysAgoIst(n);
 }
 
-/** Calendar day in the server's local timezone (not UTC). */
+/** Calendar day in IST. */
 function dateKey(d: Date) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  return dateKeyIst(d);
 }
 
-/** Parse YYYY-MM-DD as local calendar day start; falls back to null. */
+/** Parse YYYY-MM-DD as IST calendar day start; falls back to null. */
 function parseDayStart(raw: unknown): Date | null {
   if (typeof raw !== 'string' || !raw.trim()) return null;
   const parts = raw.trim().split('-').map((p) => Number(p));
   if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) return null;
-  return new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0, 0);
+  const [y, m, day] = parts;
+  const mm = String(m).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  return new Date(`${y}-${mm}-${dd}T00:00:00+05:30`);
 }
 
 function endOfDayExclusive(dayStart: Date) {
-  const d = new Date(dayStart);
-  d.setDate(d.getDate() + 1);
-  return d;
+  return new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
 }
 
 function normalizeOutcome(raw: string | undefined | null): string {
   const v = (raw || 'unknown').trim();
   if (v === 'not_pickup') return 'notPickup';
   if (v === 'not_connected') return 'notConnected';
+  if (v === 'wrong_number') return 'wrongNumber';
+  if (v === 'busy') return 'busy';
+  if (v === 'received' || v === 'connected') return 'received';
+  if (v === 'no_answer' || v === 'noAnswer') return 'notPickup';
   return v || 'unknown';
 }
 
@@ -89,57 +93,61 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     })
       .select('name email role teamId teamName')
       .sort({ name: 1 });
+    const activeAgentIds = agents.map((a) => a._id);
 
     const [
       assignments,
-      callsToday,
-      callsRange,
+      dialsToday,
+      dialsRange,
       overdueFollowUps,
       dueTodayFollowUps,
       formFillsToday,
       formFillsRange,
       followUpsRange,
     ] = await Promise.all([
-      LeadAssignment.find({ isActive: true }).select('leadId agentId'),
-      CallRecording.find({ callStartTime: { $gte: todayStart, $lt: tomorrowStart } }).select(
-        'agentId leadId durationSeconds callOutcome uploadStatus'
-      ),
-      CallRecording.find({
-        callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
-      }).select('agentId leadId callStartTime durationSeconds callOutcome uploadStatus'),
-      LeadFollowUp.find({ nextFollowupDate: { $ne: null, $lt: todayStart } })
+      LeadAssignment.find({ isActive: true, agentId: { $in: activeAgentIds } })
+        .populate<{ leadId: ILead }>('leadId')
+        .select('leadId agentId'),
+      loadCompanyDials(todayStart, tomorrowStart),
+      loadCompanyDials(rangeStart, rangeEndExclusive),
+      LeadFollowUp.find({
+        agentId: { $in: activeAgentIds },
+        nextFollowupDate: { $ne: null, $lt: todayStart },
+      })
         .select('leadId agentId nextFollowupDate remarks sequenceNumber')
         .sort({ nextFollowupDate: 1 })
         .limit(40)
         .populate('leadId', 'companyName contactPerson contactMobile leadCode leadStage')
         .populate('agentId', 'name email teamName'),
       LeadFollowUp.find({
+        agentId: { $in: activeAgentIds },
         nextFollowupDate: { $gte: todayStart, $lt: tomorrowStart },
       }).select('leadId'),
       LeadFollowUp.find({
+        agentId: { $in: activeAgentIds },
         createdAt: { $gte: todayStart, $lt: tomorrowStart },
         formFillSeconds: { $ne: null, $gte: 0 },
       }).select('agentId formFillSeconds'),
       LeadFollowUp.find({
+        agentId: { $in: activeAgentIds },
         createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
         formFillSeconds: { $ne: null, $gte: 0 },
       }).select('agentId formFillSeconds'),
       LeadFollowUp.find({
+        agentId: { $in: activeAgentIds },
         createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
       }).select('agentId'),
     ]);
-
-    const leadIds = [...new Set(assignments.map((a) => a.leadId.toString()))];
-    const calledLeadIds = new Set(
-      (await CallRecording.distinct('leadId', { leadId: { $in: leadIds } })).map((id) => id.toString())
-    );
 
     const overdueLeadIds = new Set(overdueFollowUps.map((f) => refId(f.leadId)).filter(Boolean));
     const dueTodayLeadIds = new Set(dueTodayFollowUps.map((f) => f.leadId.toString()));
     const pendingLeadIds = new Set<string>();
     for (const a of assignments) {
-      const id = a.leadId.toString();
-      if (!calledLeadIds.has(id) || overdueLeadIds.has(id) || dueTodayLeadIds.has(id)) {
+      const lead = a.leadId as ILead | null;
+      if (!lead) continue;
+      const id = lead._id.toString();
+      // Same Remaining rule as My Leads (incl. due today / overdue follow-ups).
+      if (isRemainingAssignment(lead) || overdueLeadIds.has(id) || dueTodayLeadIds.has(id)) {
         pendingLeadIds.add(id);
       }
     }
@@ -147,9 +155,11 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     const assignedByAgent = new Map<string, number>();
     const pendingByAgent = new Map<string, number>();
     for (const a of assignments) {
+      if (!a.leadId) continue;
       const aid = a.agentId.toString();
+      const lid = (a.leadId as ILead)._id.toString();
       assignedByAgent.set(aid, (assignedByAgent.get(aid) ?? 0) + 1);
-      if (pendingLeadIds.has(a.leadId.toString())) {
+      if (pendingLeadIds.has(lid)) {
         pendingByAgent.set(aid, (pendingByAgent.get(aid) ?? 0) + 1);
       }
     }
@@ -157,8 +167,8 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     const callsTodayByAgent = new Map<string, number>();
     const talkTodayByAgent = new Map<string, number>();
     let talkSecondsToday = 0;
-    for (const c of callsToday) {
-      const aid = c.agentId.toString();
+    for (const c of dialsToday) {
+      const aid = c.agentId;
       const secs = Math.max(0, c.durationSeconds || 0);
       callsTodayByAgent.set(aid, (callsTodayByAgent.get(aid) ?? 0) + 1);
       talkTodayByAgent.set(aid, (talkTodayByAgent.get(aid) ?? 0) + secs);
@@ -176,7 +186,7 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       let guard = 0;
       while (cursor < rangeEndExclusive && guard < 62) {
         dayBuckets[dateKey(cursor)] = { count: 0, talk_seconds: 0 };
-        cursor.setDate(cursor.getDate() + 1);
+        cursor.setTime(cursor.getTime() + 24 * 60 * 60 * 1000);
         guard += 1;
       }
     }
@@ -186,13 +196,13 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     let connectedCalls = 0;
     let recordingsUploaded = 0;
 
-    for (const c of callsRange) {
-      const aid = c.agentId.toString();
+    for (const c of dialsRange) {
+      const aid = c.agentId;
       const secs = Math.max(0, c.durationSeconds || 0);
       callsRangeByAgent.set(aid, (callsRangeByAgent.get(aid) ?? 0) + 1);
       talkRangeByAgent.set(aid, (talkRangeByAgent.get(aid) ?? 0) + secs);
       talkSecondsRange += secs;
-      const key = dateKey(new Date(c.callStartTime));
+      const key = dateKey(new Date(c.startTime));
       if (key in dayBuckets) {
         dayBuckets[key].count += 1;
         dayBuckets[key].talk_seconds += secs;
@@ -201,9 +211,9 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       const outcome = normalizeOutcome(c.callOutcome);
       outcomeCounts.set(outcome, (outcomeCounts.get(outcome) ?? 0) + 1);
 
-      if (outcome === 'received') {
+      if (outcome === 'received' || outcome === 'decisionMakerConnected') {
         connectedCalls += 1;
-        if (c.uploadStatus === 'uploaded') recordingsUploaded += 1;
+        if (secs > 0) recordingsUploaded += 1; // talk-linked connected dials
       }
     }
 
@@ -358,11 +368,11 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
           days,
         },
         summary: {
-          total_leads: leadIds.length,
+          total_leads: assignments.filter((a) => a.leadId).length,
           total_telecallers: agents.length,
-          calls_today: callsToday.length,
+          calls_today: dialsToday.length,
           pending_leads: pendingLeadIds.size,
-          calls_last_7_days: callsRange.length,
+          calls_last_7_days: dialsRange.length,
           talk_seconds_today: talkSecondsToday,
           talk_seconds_last_7_days: talkSecondsRange,
           avg_form_fill_seconds_today: fillToday.companyAvg,

@@ -345,3 +345,124 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
     recent_calls: recentCalls,
   };
 }
+
+export type CompanyDialRow = {
+  agentId: string;
+  startTime: Date;
+  durationSeconds: number;
+  callOutcome: string | null;
+  source: 'follow_up' | 'remote';
+};
+
+function outcomeFromRemoteStatus(status: string): string {
+  switch (status) {
+    case 'ended':
+    case 'active':
+      return 'received';
+    case 'no_answer':
+      return 'notPickup';
+    case 'busy':
+      return 'busy';
+    case 'failed':
+    case 'rejected':
+      return 'notConnected';
+    default:
+      return 'unknown';
+  }
+}
+
+/**
+ * Company-wide dials for admin dashboard (same rules as telecaller Performance):
+ * follow-up forms + remote dials; recordings never count as dials.
+ * Only active telecallers are included (test / deactivated users excluded).
+ */
+export async function loadCompanyDials(
+  rangeStart: Date,
+  rangeEndExclusive: Date
+): Promise<CompanyDialRow[]> {
+  const activeAgents = await User.find({
+    role: { $in: ['agent', 'manager'] },
+    isActive: true,
+  }).select('_id');
+  const activeIds = activeAgents.map((u) => u._id);
+  if (activeIds.length === 0) return [];
+
+  const [followUps, remotes, talkRecordings] = await Promise.all([
+    LeadFollowUp.find({
+      agentId: { $in: activeIds },
+      createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
+    }).select('agentId leadId clientCallId callOutcome createdAt'),
+    RemoteCall.find({
+      agentId: { $in: activeIds },
+      startTime: { $gte: rangeStart, $lt: rangeEndExclusive },
+      status: { $in: [...REMOTE_TERMINAL] },
+    }).select('agentId callId leadId startTime durationSeconds status'),
+    CallRecording.find({
+      agentId: { $in: activeIds },
+      callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
+    }).select('clientCallId durationSeconds'),
+  ]);
+
+  const talkByClient = new Map<string, number>();
+  for (const r of talkRecordings) {
+    if (!r.clientCallId) continue;
+    const secs = Math.max(0, r.durationSeconds || 0);
+    talkByClient.set(r.clientCallId, Math.max(talkByClient.get(r.clientCallId) ?? 0, secs));
+  }
+
+  const rows: CompanyDialRow[] = [];
+  const countedClientIds = new Set<string>();
+  const dialTimesByLeadAgent = new Map<string, number[]>();
+  const keyFor = (agentId: string, leadId: string) => `${agentId}:${leadId}`;
+
+  const near = (agentId: string, leadId: string, startMs: number, windowMs = 5 * 60 * 1000) => {
+    const list = dialTimesByLeadAgent.get(keyFor(agentId, leadId));
+    if (!list?.length) return false;
+    return list.some((t) => Math.abs(t - startMs) <= windowMs);
+  };
+
+  const mark = (agentId: string, leadId: string, startMs: number, clientId?: string | null) => {
+    if (clientId) countedClientIds.add(clientId);
+    if (!leadId) return;
+    const k = keyFor(agentId, leadId);
+    const list = dialTimesByLeadAgent.get(k) ?? [];
+    list.push(startMs);
+    dialTimesByLeadAgent.set(k, list);
+  };
+
+  for (const f of followUps) {
+    const agentId = f.agentId?.toString() || '';
+    if (!agentId) continue;
+    const clientId = f.clientCallId?.trim() || '';
+    const leadId = f.leadId?.toString() || '';
+    const startMs = f.createdAt ? new Date(f.createdAt).getTime() : Date.now();
+    rows.push({
+      agentId,
+      startTime: f.createdAt,
+      durationSeconds: clientId ? talkByClient.get(clientId) ?? 0 : 0,
+      callOutcome: f.callOutcome ?? null,
+      source: 'follow_up',
+    });
+    mark(agentId, leadId, startMs, clientId || null);
+  }
+
+  for (const c of remotes) {
+    const agentId = c.agentId?.toString() || '';
+    if (!agentId) continue;
+    if (c.callId && countedClientIds.has(c.callId)) continue;
+    const leadId = c.leadId?.toString() || '';
+    const startMs = new Date(c.startTime).getTime();
+    if (leadId && near(agentId, leadId, startMs)) continue;
+
+    rows.push({
+      agentId,
+      startTime: c.startTime,
+      durationSeconds: Math.max(0, c.durationSeconds || 0),
+      callOutcome: outcomeFromRemoteStatus(c.status),
+      source: 'remote',
+    });
+    mark(agentId, leadId, startMs, c.callId);
+  }
+
+  return rows;
+}
