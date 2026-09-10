@@ -39,11 +39,10 @@ import { buildLeadTrackerWorkbook, loadFollowUpsByLeadId } from '../../services/
 import { getNextLeadCode } from '../../services/leadCodeService';
 
 import {
-  countAgentTabTotals,
-  extractAgentFilterOptions,
   filterAgentLeadAssignments,
   parseAgentLeadQuery,
 } from './leadListFilters';
+import { queryAgentFilterOptions, queryAgentLeadsPage } from './agentLeadQueryService';
 
 import { LeadStatus } from '../../types/enums';
 
@@ -174,15 +173,7 @@ leadsRouter.get('/filters', async (req: AuthRequest, res: Response, next: NextFu
 
     const userId = req.user!.id;
 
-    const assignments = await LeadAssignment.find({ agentId: userId, isActive: true }).populate<{ leadId: ILead }>(
-
-      'leadId'
-
-    );
-
-    const leads = assignments.map((a) => a.leadId).filter(Boolean);
-
-    res.json({ data: extractAgentFilterOptions(leads) });
+    res.json({ data: await queryAgentFilterOptions(userId) });
 
   } catch (err) {
 
@@ -260,64 +251,37 @@ leadsRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction)
 
     const userId = req.user!.id;
 
-    const { status, search, page, limit, tab } = req.query;
-
-
+    const { status, page, limit, include_counts } = req.query;
 
     const pageNum = Math.max(1, parseInt(page as string, 10) || 1);
     const parsedLimit = parseInt(String(limit ?? ''), 10);
     const limitNum = Math.min(100, Math.max(1, Number.isFinite(parsedLimit) ? parsedLimit : 30));
-    const skip = (pageNum - 1) * limitNum;
-
-    const agent = await User.findById(userId).select('name email teamName');
-
-    const assignments = await LeadAssignment.find({
-      agentId: userId,
-      isActive: true,
-    })
-      .sort({ assignedAt: -1 })
-      .populate<{ leadId: ILead }>('leadId');
-
-    const populated = assignments.map((a) => ({ leadId: a.leadId, assignedAt: a.assignedAt }));
     const listQuery = parseAgentLeadQuery(req.query as Record<string, unknown>);
 
-    // Tab badge totals use the same filters/search, ignoring the selected tab.
-    const { remaining: remainingCount, called: calledCount } = countAgentTabTotals(populated, {
-      search: listQuery.search,
-      lead_status: listQuery.lead_status,
-      lead_stage: listQuery.lead_stage,
-      priority: listQuery.priority,
-      customer_type: listQuery.customer_type,
-      product: listQuery.product,
-      state: listQuery.state,
-      district: listQuery.district,
-      city: listQuery.city,
-    });
-
-    let filtered = filterAgentLeadAssignments(populated, listQuery);
-
+    let legacyStatus: string | undefined;
     if (status && typeof status === 'string') {
       if (!isValidLeadStatus(status)) {
         throw new AppError(400, 'Invalid status value.');
       }
-      filtered = filtered.filter((a) => a.leadId.status === status);
+      legacyStatus = status;
     }
 
-    const total = filtered.length;
-    const paged = filtered.slice(skip, skip + limitNum);
-    const data = paged.map((a) => formatLead(a.leadId, a.assignedAt, agent));
+    // Page 2+ (scroll) skips badge recounts — Flutter already has remaining/called from page 1.
+    const includeCounts =
+      include_counts === '0' || include_counts === 'false'
+        ? false
+        : pageNum === 1 || include_counts === '1' || include_counts === 'true';
 
-    res.json({
-      data,
-      meta: {
-        page: pageNum,
-        limit: limitNum,
-        total,
-        total_pages: Math.max(1, Math.ceil(total / limitNum)),
-        remaining_count: remainingCount,
-        called_count: calledCount,
-      },
+    const result = await queryAgentLeadsPage({
+      userId,
+      page: pageNum,
+      limit: limitNum,
+      query: listQuery,
+      legacyStatus,
+      includeCounts,
     });
+
+    res.json(result);
 
   } catch (err) {
 

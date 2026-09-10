@@ -20,6 +20,8 @@ const leadAssignmentSchema = new Schema<ILeadAssignment>(
 );
 
 leadAssignmentSchema.index({ agentId: 1, isActive: 1 });
+leadAssignmentSchema.index({ agentId: 1, isActive: 1, assignedAt: -1 });
+leadAssignmentSchema.index({ leadId: 1, agentId: 1, isActive: 1 });
 
 export const LeadAssignment: Model<ILeadAssignment> =
   mongoose.models.LeadAssignment ||

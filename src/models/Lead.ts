@@ -280,7 +280,9 @@ const leadSchema = new Schema<ILead>(
 
 );
 
-
+leadSchema.index({ callCount: 1, lastCalledAt: 1 });
+leadSchema.index({ nextFollowupDate: 1 });
+leadSchema.index({ importBatchId: 1, importRowNumber: 1 });
 
 export const Lead: Model<ILead> =
 

@@ -11,6 +11,7 @@ import { ILead } from '../../models/Lead';
 import { adminUsersRouter } from './adminUsers.routes';
 import { adminTeamsRouter } from './adminTeams.routes';
 import { adminDashboardRouter } from './adminDashboard.routes';
+import { queryAdminLeadsPage } from './adminLeadQueryService';
 
 export const adminRouter = Router();
 
@@ -242,46 +243,21 @@ adminRouter.get('/leads/export', async (req: AuthRequest, res: Response, next: N
 adminRouter.get('/leads', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
-    const limit = 50;
+    const parsedLimit = parseInt(String(req.query.limit ?? ''), 10);
+    const limit = Math.min(100, Math.max(1, Number.isFinite(parsedLimit) ? parsedLimit : 50));
+    const includeCounts =
+      req.query.include_counts === '0' || req.query.include_counts === 'false'
+        ? false
+        : page === 1 || req.query.include_counts === '1' || req.query.include_counts === 'true';
 
-    // Counts for both tabs use the same filters (minus tab).
-    const allRows = await fetchExportRows(req.query, { applyTab: false });
-    const remainingCount = allRows.filter((r) => (r.lead.callCount ?? 0) === 0).length;
-    const calledCount = allRows.filter((r) => (r.lead.callCount ?? 0) > 0).length;
-
-    const tab = typeof req.query.tab === 'string' ? req.query.tab : 'remaining';
-    const rows =
-      tab === 'called'
-        ? allRows.filter((r) => (r.lead.callCount ?? 0) > 0)
-        : allRows.filter((r) => (r.lead.callCount ?? 0) === 0);
-
-    const total = rows.length;
-    const totalPages = Math.max(1, Math.ceil(total / limit));
-    const slice = rows.slice((page - 1) * limit, page * limit);
-
-    const data = await Promise.all(
-      slice.map(async ({ lead, salesExecutive }) => {
-        const assignment = await LeadAssignment.findOne({ leadId: lead._id, isActive: true });
-        const agent = assignment
-          ? await User.findById(assignment.agentId).select('name email teamName')
-          : null;
-        const formatted = formatLead(lead, assignment?.assignedAt ?? lead.createdAt, agent);
-        if (!formatted.sales_executive) formatted.sales_executive = salesExecutive;
-        return formatted;
-      })
-    );
-
-    res.json({
-      data,
-      meta: {
-        total,
-        page,
-        total_pages: totalPages,
-        remaining_count: remainingCount,
-        called_count: calledCount,
-        tab: tab === 'called' ? 'called' : 'remaining',
-      },
+    const result = await queryAdminLeadsPage({
+      query: req.query as Record<string, unknown>,
+      page,
+      limit,
+      includeCounts,
     });
+
+    res.json(result);
   } catch (err) {
     next(err);
   }
