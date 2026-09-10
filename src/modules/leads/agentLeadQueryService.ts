@@ -1,8 +1,8 @@
 import { PipelineStage, Types } from 'mongoose';
-import { Lead, LeadAssignment, User } from '../../models';
+import { Lead, LeadAssignment, LeadFollowUp, User } from '../../models';
 import { ILead } from '../../models/Lead';
 import { formatLead } from '../../utils/helpers';
-import { startOfIstDay } from '../../utils/istCalendar';
+import { dateKeyIst, startOfIstDay } from '../../utils/istCalendar';
 import { AgentLeadQuery } from './leadListFilters';
 
 function tomorrowIst(): Date {
@@ -25,18 +25,56 @@ function workedMatch(): Record<string, unknown> {
   };
 }
 
-/** Remaining tab: never worked OR next follow-up overdue/due today. */
-function remainingTabMatch(tomorrowStart: Date): Record<string, unknown> {
+/**
+ * Match Flutter Follow-ups "Today/Overdue": IST calendar day of nextFollowupDate
+ * is on or before today's IST calendar day.
+ */
+function dueOnOrBeforeTodayExpr(todayKey: string): Record<string, unknown> {
   return {
-    $or: [
-      neverWorkedMatch(),
+    $lte: [
       {
-        'lead.nextFollowupDate': {
-          $ne: null,
-          $lt: tomorrowStart,
+        $dateToString: {
+          format: '%Y-%m-%d',
+          date: '$nextFollowupDate',
+          timezone: 'Asia/Kolkata',
         },
       },
+      todayKey,
     ],
+  };
+}
+
+function leadDueOnOrBeforeTodayExpr(todayKey: string): Record<string, unknown> {
+  return {
+    $and: [
+      { $ne: ['$lead.nextFollowupDate', null] },
+      {
+        $lte: [
+          {
+            $dateToString: {
+              format: '%Y-%m-%d',
+              date: '$lead.nextFollowupDate',
+              timezone: 'Asia/Kolkata',
+            },
+          },
+          todayKey,
+        ],
+      },
+    ],
+  };
+}
+
+/** Remaining tab: never worked OR next follow-up overdue/due today (IST). */
+function remainingTabMatch(
+  todayKey: string,
+  dueFollowUpLeadIds: Types.ObjectId[]
+): Record<string, unknown> {
+  const dueClauses: Record<string, unknown>[] = [{ $expr: leadDueOnOrBeforeTodayExpr(todayKey) }];
+  if (dueFollowUpLeadIds.length > 0) {
+    dueClauses.push({ 'lead._id': { $in: dueFollowUpLeadIds } });
+  }
+  return {
+    $or: [neverWorkedMatch(), ...dueClauses],
   };
 }
 
@@ -104,27 +142,49 @@ const LEAD_LITE_PROJECT = {
   createdAt: 1,
 };
 
-function remainingSortStages(tomorrowStart: Date) {
+function remainingSortStages(todayKey: string) {
   const todayStart = startOfIstDay();
+  const tomorrowStart = tomorrowIst();
+  const followUpCollection = LeadFollowUp.collection.collectionName;
   return [
+    {
+      $lookup: {
+        from: followUpCollection,
+        let: { lid: '$lead._id' },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [{ $eq: ['$leadId', '$$lid'] }, { $ne: ['$nextFollowupDate', null] }, dueOnOrBeforeTodayExpr(todayKey)],
+              },
+            },
+          },
+          { $sort: { nextFollowupDate: 1 as const } },
+          { $limit: 1 },
+          { $project: { nextFollowupDate: 1 } },
+        ],
+        as: '_dueFu',
+      },
+    },
+    {
+      $addFields: {
+        _dueDate: {
+          $ifNull: [{ $arrayElemAt: ['$_dueFu.nextFollowupDate', 0] }, '$lead.nextFollowupDate'],
+        },
+      },
+    },
     {
       $addFields: {
         _fuRank: {
           $cond: [
             {
-              $and: [
-                { $ne: ['$lead.nextFollowupDate', null] },
-                { $lt: ['$lead.nextFollowupDate', todayStart] },
-              ],
+              $and: [{ $ne: ['$_dueDate', null] }, { $lt: ['$_dueDate', todayStart] }],
             },
             0,
             {
               $cond: [
                 {
-                  $and: [
-                    { $ne: ['$lead.nextFollowupDate', null] },
-                    { $lt: ['$lead.nextFollowupDate', tomorrowStart] },
-                  ],
+                  $and: [{ $ne: ['$_dueDate', null] }, { $lt: ['$_dueDate', tomorrowStart] }],
                 },
                 1,
                 2,
@@ -139,8 +199,7 @@ function remainingSortStages(tomorrowStart: Date) {
     {
       $sort: {
         _fuRank: 1 as const,
-        'lead.nextFollowupDate': 1 as const,
-        // Excel / sheet order: row 1 at the top (not last-imported first).
+        _dueDate: 1 as const,
         _row: 1 as const,
         _created: 1 as const,
         'lead._id': 1 as const,
@@ -205,8 +264,38 @@ export async function queryAgentLeadsPage(input: {
   const { userId, page, limit, query, legacyStatus } = input;
   const includeCounts = input.includeCounts !== false;
   const agentObjectId = new Types.ObjectId(userId);
-  const tomorrowStart = tomorrowIst();
+  const todayKey = dateKeyIst(new Date());
   const skip = (page - 1) * limit;
+
+  const dueFollowUpRows = await LeadFollowUp.find({
+    agentId: agentObjectId,
+    nextFollowupDate: { $ne: null },
+    $expr: dueOnOrBeforeTodayExpr(todayKey),
+  })
+    .select('leadId nextFollowupDate')
+    .lean();
+
+  const dueFollowUpLeadIds = [
+    ...new Map(
+      dueFollowUpRows.map((r) => [String(r.leadId), r.leadId as Types.ObjectId])
+    ).values(),
+  ];
+
+  // Always mirror the earliest due FollowUp date onto Lead (fixes stale/missing denormalized field).
+  if (dueFollowUpRows.length > 0) {
+    const earliestByLead = new Map<string, Date>();
+    for (const row of dueFollowUpRows) {
+      const id = String(row.leadId);
+      const d = row.nextFollowupDate as Date;
+      const prev = earliestByLead.get(id);
+      if (!prev || d < prev) earliestByLead.set(id, d);
+    }
+    await Promise.all(
+      [...earliestByLead.entries()].map(([id, nextFollowupDate]) =>
+        Lead.updateOne({ _id: id }, { $set: { nextFollowupDate } })
+      )
+    );
+  }
 
   const fieldFilters = buildLeadFieldFilters(query);
   const searchMatch = buildSearchMatch(query.search);
@@ -216,9 +305,9 @@ export async function queryAgentLeadsPage(input: {
   if (legacyStatus) extraFilters.push({ 'lead.status': legacyStatus });
 
   const tab = query.tab === 'called' ? 'called' : 'remaining';
-  const tabMatch = tab === 'called' ? calledTabMatch() : remainingTabMatch(tomorrowStart);
-  const sortStages =
-    tab === 'called' ? calledSortStages() : remainingSortStages(tomorrowStart);
+  const tabMatch =
+    tab === 'called' ? calledTabMatch() : remainingTabMatch(todayKey, dueFollowUpLeadIds);
+  const sortStages = tab === 'called' ? calledSortStages() : remainingSortStages(todayKey);
 
   const facetBranches: Record<string, object[]> = {
     total: [{ $match: tabMatch }, { $count: 'n' }],
@@ -232,7 +321,10 @@ export async function queryAgentLeadsPage(input: {
   };
 
   if (includeCounts) {
-    facetBranches.remaining = [{ $match: remainingTabMatch(tomorrowStart) }, { $count: 'n' }];
+    facetBranches.remaining = [
+      { $match: remainingTabMatch(todayKey, dueFollowUpLeadIds) },
+      { $count: 'n' },
+    ];
     facetBranches.called = [{ $match: calledTabMatch() }, { $count: 'n' }];
   }
 

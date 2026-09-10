@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { CallRecording, Lead, LeadFollowUp } from '../../models';
 import { AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
-import { isLeadAssignedToAgent, createAuditLog, parseOptionalDate } from '../../utils/helpers';
+import { isLeadAssignedToAgent, createAuditLog, parseOptionalCalendarDate } from '../../utils/helpers';
 import { isSundayIst } from '../../utils/istCalendar';
 import { formatFollowUp } from '../../utils/followUpFormat';
 import { ILeadFollowUp } from '../../models/LeadFollowUp';
@@ -107,7 +107,7 @@ export async function upsertLeadFollowUp(params: {
     }
   }
 
-  const nextFollowupDate = parseOptionalDate(body.next_followup_date);
+  const nextFollowupDate = parseOptionalCalendarDate(body.next_followup_date);
   assertFollowUpDateNotSunday(nextFollowupDate);
   const callOutcome = body.call_outcome?.trim() || 'unknown';
   const leadResult = body.lead_result?.trim() || undefined;
@@ -182,8 +182,14 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
     followup2Date: f2?.createdAt,
     followup3: f3?.remarks,
     followup3Date: f3?.createdAt,
-    nextFollowupDate: scheduled?.nextFollowupDate,
   };
+  const $unset: Record<string, 1> = {};
+
+  if (scheduled?.nextFollowupDate) {
+    $set.nextFollowupDate = scheduled.nextFollowupDate;
+  } else {
+    $unset.nextFollowupDate = 1;
+  }
 
   if (f1) $set.followupRemarks = f1.remarks;
   else if (latest) $set.followupRemarks = latest.remarks;
@@ -225,7 +231,17 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
     }
   }
 
-  await Lead.updateOne({ _id: leadId }, { $set });
+  // Drop undefined keys so Mongo doesn't null them out.
+  for (const key of Object.keys($set)) {
+    if ($set[key] === undefined) delete $set[key];
+  }
+
+  const update: Record<string, unknown> = {};
+  if (Object.keys($set).length) update.$set = $set;
+  if (Object.keys($unset).length) update.$unset = $unset;
+  if (Object.keys(update).length) {
+    await Lead.updateOne({ _id: leadId }, update);
+  }
 }
 
 followUpsRouter.post('/leads/:leadId', async (req: AuthRequest, res: Response, next: NextFunction) => {

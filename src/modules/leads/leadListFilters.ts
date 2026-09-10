@@ -1,4 +1,5 @@
 import { ILead } from '../../models/Lead';
+import { startOfIstDay } from '../../utils/istCalendar';
 
 export interface AgentLeadQuery {
   search?: string;
@@ -19,26 +20,23 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function dayOnly(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
-}
-
-/** Overdue or due today — must be dialed before fresh remaining leads. */
+/** Overdue or due today (IST calendar) — must be dialed before fresh remaining leads. */
 function hasCompulsoryFollowUp(nextFollowupDate: Date | string | null | undefined): boolean {
   if (!nextFollowupDate) return false;
   const raw = nextFollowupDate instanceof Date ? nextFollowupDate : new Date(nextFollowupDate);
   if (Number.isNaN(raw.getTime())) return false;
-  const day = dayOnly(raw);
-  const today = dayOnly(new Date());
-  return day.getTime() <= today.getTime();
+  const tomorrow = new Date(startOfIstDay().getTime() + 24 * 60 * 60 * 1000);
+  return raw.getTime() < tomorrow.getTime();
 }
 
 function followUpRank(lead: ILead): number {
   if (!lead.nextFollowupDate) return 2;
-  const day = dayOnly(new Date(lead.nextFollowupDate));
-  const today = dayOnly(new Date());
-  if (day.getTime() < today.getTime()) return 0; // overdue
-  if (day.getTime() === today.getTime()) return 1; // today
+  const raw = new Date(lead.nextFollowupDate);
+  if (Number.isNaN(raw.getTime())) return 2;
+  const todayStart = startOfIstDay();
+  const tomorrow = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+  if (raw.getTime() < todayStart.getTime()) return 0; // overdue
+  if (raw.getTime() < tomorrow.getTime()) return 1; // today
   return 2;
 }
 

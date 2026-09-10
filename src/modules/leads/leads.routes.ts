@@ -26,6 +26,8 @@ import {
 
   parseOptionalDate,
 
+  parseOptionalCalendarDate,
+
   parseOptionalNumber,
 
   parseOptionalString,
@@ -480,7 +482,7 @@ function applyFollowUpFields(lead: ILead, body: z.infer<typeof updateLeadSchema>
   if (body.last_contact_date !== undefined) lead.lastContactDate = date('last_contact_date');
 
   if (body.next_followup_date !== undefined) {
-    const next = date('next_followup_date');
+    const next = parseOptionalCalendarDate(body.next_followup_date);
     if (next && isSundayIst(next)) {
       throw new AppError(400, 'Follow-up cannot be set on Sunday. Please choose another day.');
     }

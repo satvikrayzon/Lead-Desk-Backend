@@ -55,5 +55,18 @@ export function parseClientDateTime(raw: string): Date {
     return new Date(`${s}+05:30`);
   }
 
+  // Date-only (YYYY-MM-DD) is calendar day in IST.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    return new Date(`${s}T00:00:00+05:30`);
+  }
+
   return new Date(s);
+}
+
+/** Calendar day (follow-up schedule) → 00:00 IST on that day. */
+export function parseClientCalendarDate(raw: string): Date {
+  const d = parseClientDateTime(raw);
+  if (Number.isNaN(d.getTime())) return d;
+  const key = dateKeyIst(d);
+  return new Date(`${key}T00:00:00+05:30`);
 }

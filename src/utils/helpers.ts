@@ -8,6 +8,8 @@ import { AuditLog } from '../models';
 
 import { LeadStatus } from '../types/enums';
 
+import { parseClientCalendarDate, parseClientDateTime } from './istCalendar';
+
 
 
 export interface LeadResponse {
@@ -464,15 +466,18 @@ export function isDuplicateKeyError(err: unknown): boolean {
 
 
 export function parseOptionalDate(value: unknown): Date | undefined {
-
   if (value === null || value === undefined || value === '') return undefined;
-
-  const d = new Date(value as string);
-
+  const d = parseClientDateTime(String(value));
   if (Number.isNaN(d.getTime())) return undefined;
-
   return d;
+}
 
+/** Follow-up schedule dates: normalize to 00:00 IST on that calendar day. */
+export function parseOptionalCalendarDate(value: unknown): Date | undefined {
+  if (value === null || value === undefined || value === '') return undefined;
+  const d = parseClientCalendarDate(String(value));
+  if (Number.isNaN(d.getTime())) return undefined;
+  return d;
 }
 
 
