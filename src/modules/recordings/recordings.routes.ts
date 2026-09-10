@@ -14,6 +14,7 @@ import {
   isDuplicateKeyError,
 } from '../../utils/helpers';
 import { saveLocalRecording, resolveLocalRecordingPath } from '../../services/localRecordingStore';
+import { parseClientDateTime } from '../../utils/istCalendar';
 import { RecordingSource } from '../../types/enums';
 import { notifyRecordingReady } from '../../services/realtimeNotify';
 
@@ -53,8 +54,8 @@ recordingsRouter.post(
         throw new AppError(400, `Invalid source value "${source}". Expected miuiNative or fallback.`);
       }
 
-      const callStartTime = new Date(call_start_time);
-      const callEndTime = new Date(call_end_time);
+      const callStartTime = parseClientDateTime(String(call_start_time));
+      const callEndTime = parseClientDateTime(String(call_end_time));
       const durationSeconds = parseInt(duration_seconds, 10);
 
       if (isNaN(callStartTime.getTime()) || isNaN(callEndTime.getTime())) {

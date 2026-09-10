@@ -4,6 +4,7 @@ import { CallRecording, Lead, LeadFollowUp } from '../../models';
 import { AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { isLeadAssignedToAgent, createAuditLog, parseOptionalDate } from '../../utils/helpers';
+import { isSundayIst } from '../../utils/istCalendar';
 import { formatFollowUp } from '../../utils/followUpFormat';
 import { ILeadFollowUp } from '../../models/LeadFollowUp';
 import { ILead } from '../../models/Lead';
@@ -20,6 +21,13 @@ const createFollowUpSchema = z.object({
   /** Client-measured seconds from form open to save (0–7200). */
   form_fill_seconds: z.number().int().min(0).max(7200).optional(),
 });
+
+function assertFollowUpDateNotSunday(date: Date | undefined | null) {
+  if (!date) return;
+  if (isSundayIst(date)) {
+    throw new AppError(400, 'Follow-up cannot be set on Sunday. Please choose another day.');
+  }
+}
 
 /** Scheduled follow-ups across all leads for the logged-in agent. */
 followUpsRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -100,6 +108,7 @@ export async function upsertLeadFollowUp(params: {
   }
 
   const nextFollowupDate = parseOptionalDate(body.next_followup_date);
+  assertFollowUpDateNotSunday(nextFollowupDate);
   const callOutcome = body.call_outcome?.trim() || 'unknown';
   const leadResult = body.lead_result?.trim() || undefined;
   const formFillSeconds =

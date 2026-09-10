@@ -430,12 +430,11 @@ adminDashboardRouter.get(
       if (!Types.ObjectId.isValid(userId)) throw new AppError(400, 'Invalid user id.');
 
       const dateRaw = String(req.query.date || dateKey(new Date()));
-      const parts = dateRaw.split('-').map((p) => Number(p));
-      if (parts.length !== 3 || parts.some((n) => Number.isNaN(n))) {
+      const dayStart = parseDayStart(dateRaw);
+      if (!dayStart) {
         throw new AppError(400, 'date must be YYYY-MM-DD.');
       }
-      const dayStart = new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0, 0);
-      const dayEnd = new Date(parts[0], parts[1] - 1, parts[2] + 1, 0, 0, 0, 0);
+      const dayEnd = endOfDayExclusive(dayStart);
 
       const user = await User.findById(userId).select('name email role teamName');
       if (!user) throw new AppError(404, 'Telecaller not found.');

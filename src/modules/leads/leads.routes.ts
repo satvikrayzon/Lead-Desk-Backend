@@ -48,6 +48,8 @@ import { LeadStatus } from '../../types/enums';
 
 import { ILead } from '../../models/Lead';
 
+import { isSundayIst } from '../../utils/istCalendar';
+
 
 
 export const leadsRouter = Router();
@@ -469,7 +471,13 @@ function applyFollowUpFields(lead: ILead, body: z.infer<typeof updateLeadSchema>
 
   if (body.last_contact_date !== undefined) lead.lastContactDate = date('last_contact_date');
 
-  if (body.next_followup_date !== undefined) lead.nextFollowupDate = date('next_followup_date');
+  if (body.next_followup_date !== undefined) {
+    const next = date('next_followup_date');
+    if (next && isSundayIst(next)) {
+      throw new AppError(400, 'Follow-up cannot be set on Sunday. Please choose another day.');
+    }
+    lead.nextFollowupDate = next;
+  }
 
   if (body.followup_remarks !== undefined) lead.followupRemarks = str('followup_remarks');
 
