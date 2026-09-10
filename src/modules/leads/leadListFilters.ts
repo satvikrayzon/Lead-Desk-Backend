@@ -108,8 +108,11 @@ function compareRemainingAssignments(a: PopulatedAssignment, b: PopulatedAssignm
   return newestTimestamp(a) - newestTimestamp(b);
 }
 
-/** Called tab: most recently assigned/created first. */
+/** Called tab: most recently dialed first (then assigned/created). */
 function compareCalledAssignments(a: PopulatedAssignment, b: PopulatedAssignment): number {
+  const la = a.leadId.lastCalledAt ? new Date(a.leadId.lastCalledAt).getTime() : 0;
+  const lb = b.leadId.lastCalledAt ? new Date(b.leadId.lastCalledAt).getTime() : 0;
+  if (la !== lb) return lb - la;
   return newestTimestamp(b) - newestTimestamp(a);
 }
 
@@ -192,23 +195,24 @@ export function filterAgentLeadAssignments(
   return filtered;
 }
 
-/** True when the lead has been worked (call / follow-up / form), not raw import. */
+/** True when the lead has actually been dialed (not just form-edited). */
 function hasBeenWorked(lead: ILead): boolean {
   if ((lead.callCount ?? 0) > 0) return true;
   if (lead.lastCalledAt) return true;
-  if (lead.lastContactDate) return true;
-  if (typeof lead.lastFormFillSeconds === 'number') return true;
-  if (typeof lead.avgFormFillSeconds === 'number' && lead.avgFormFillSeconds > 0) return true;
-  if (lead.followupRemarks && String(lead.followupRemarks).trim()) return true;
   return false;
 }
 
+/**
+ * Remaining = never dialed, OR dialed but follow-up overdue/due today
+ * (so the dial queue still surfaces compulsory re-calls).
+ */
 export function isRemainingAssignment(lead: ILead): boolean {
   return !hasBeenWorked(lead) || hasCompulsoryFollowUp(lead.nextFollowupDate);
 }
 
+/** Called = every lead dialed at least once (full history, not today-only). */
 export function isCalledAssignment(lead: ILead): boolean {
-  return hasBeenWorked(lead) && !hasCompulsoryFollowUp(lead.nextFollowupDate);
+  return hasBeenWorked(lead);
 }
 
 export function countAgentTabTotals(
@@ -219,8 +223,9 @@ export function countAgentTabTotals(
   let remaining = 0;
   let called = 0;
   for (const a of base) {
+    // Tabs can overlap: a dialed lead with FU due today is in both.
     if (isRemainingAssignment(a.leadId)) remaining += 1;
-    else if (isCalledAssignment(a.leadId)) called += 1;
+    if (isCalledAssignment(a.leadId)) called += 1;
   }
   return { remaining, called };
 }

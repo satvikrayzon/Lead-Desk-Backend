@@ -180,11 +180,18 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
   if (latest) lead.lastContactDate = latest.createdAt;
   lead.nextFollowupDate = scheduled?.nextFollowupDate;
 
-  // Keep Called-tab stats in sync even when no recording was uploaded (Windows CRM).
-  lead.callCount = Math.max(lead.callCount ?? 0, followUps.length);
-  if (latest) {
-    if (!lead.lastCalledAt || latest.createdAt >= lead.lastCalledAt) {
-      lead.lastCalledAt = latest.createdAt;
+  // Every saved follow-up after a dial (incl. no-answer / busy) counts toward Called.
+  const dialFollowUps = followUps.filter((f) => {
+    const o = (f.callOutcome || '').trim().toLowerCase();
+    return Boolean(f.clientCallId) || (o.length > 0 && o !== 'unknown');
+  });
+  if (dialFollowUps.length > 0) {
+    lead.callCount = Math.max(lead.callCount ?? 0, dialFollowUps.length);
+    const latestDial = dialFollowUps[dialFollowUps.length - 1];
+    if (latestDial.createdAt) {
+      if (!lead.lastCalledAt || latestDial.createdAt >= lead.lastCalledAt) {
+        lead.lastCalledAt = latestDial.createdAt;
+      }
     }
   }
 

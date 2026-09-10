@@ -51,35 +51,44 @@ export type DailySalesReport = {
 };
 
 function startOfDay(d = new Date()) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
+  const key = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+  return new Date(`${key}T00:00:00+05:30`);
 }
 
 function dateKey(d: Date) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
 }
 
 function dateDisplay(d: Date) {
-  const day = String(d.getDate()).padStart(2, '0');
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  return `${day}-${m}-${d.getFullYear()}`;
+  const key = dateKey(d);
+  const [y, m, day] = key.split('-');
+  return `${day}-${m}-${y}`;
 }
 
 export function parseReportDay(raw: unknown): Date {
   if (typeof raw === 'string' && raw.trim()) {
     const parts = raw.trim().split('-').map((p) => Number(p));
     if (parts.length === 3 && !parts.some((n) => Number.isNaN(n))) {
-      return new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0, 0);
+      const [y, m, day] = parts;
+      const mm = String(m).padStart(2, '0');
+      const dd = String(day).padStart(2, '0');
+      return new Date(`${y}-${mm}-${dd}T00:00:00+05:30`);
     }
   }
   return startOfDay();
 }
 
-/** Inclusive calendar range: from 00:00 of fromDay through 00:00 of day after toDay. */
+/** Inclusive calendar range: from 00:00 IST of fromDay through 00:00 IST of day after toDay. */
 export function parseReportRange(query: {
   date?: unknown;
   from?: unknown;
@@ -88,8 +97,7 @@ export function parseReportRange(query: {
   const fromDay = parseReportDay(query.from ?? query.date);
   let toDay = parseReportDay(query.to ?? query.from ?? query.date);
   if (toDay < fromDay) toDay = fromDay;
-  const rangeEndExclusive = new Date(toDay);
-  rangeEndExclusive.setDate(rangeEndExclusive.getDate() + 1);
+  const rangeEndExclusive = new Date(toDay.getTime() + 24 * 60 * 60 * 1000);
   return {
     rangeStart: fromDay,
     rangeEndExclusive,
@@ -104,7 +112,6 @@ function normalizeOutcome(raw: string | undefined | null): string {
   if (v === 'not_connected') return 'notConnected';
   if (v === 'wrong_number') return 'wrongNumber';
   if (v === 'decision_maker' || v === 'decision_maker_connected') return 'decisionMakerConnected';
-  // New UI labels stored as same db values
   if (v === 'connected') return 'received';
   if (v === 'no_answer' || v === 'noAnswer') return 'notPickup';
   return v || 'unknown';
@@ -235,22 +242,10 @@ function classifyDial(bucket: CallBuckets, outcomeRaw: string, talkSeconds = 0) 
       bucket.wrongNumber += 1;
       break;
     default:
-      // Still counts as attempted even if status unknown.
       break;
   }
 }
 
-/**
- * Build daily/range sales report.
- *
- * Calling performance:
- *  - Attempted = every dial (recording / Windows remote / follow-up-only)
- *  - Connected / No Answer / Busy / Wrong Number = telecaller call-status on the form
- *    when present; else recording/remote inferred status
- *
- * Lead & sales status:
- *  - Counts from follow-up form `lead_result` dropdown for the period
- */
 export async function buildDailySalesReport(
   agentId: string,
   rangeStart: Date,
@@ -266,24 +261,28 @@ export async function buildDailySalesReport(
   const fromKey = dateKey(rangeStart);
   const toKey = dateKey(new Date(rangeEndExclusive.getTime() - 1));
   const dateDisplayStr =
-    fromKey === toKey ? dateDisplay(rangeStart) : `${dateDisplay(rangeStart)} → ${dateDisplay(new Date(rangeEndExclusive.getTime() - 1))}`;
+    fromKey === toKey
+      ? dateDisplay(rangeStart)
+      : `${dateDisplay(rangeStart)} → ${dateDisplay(new Date(rangeEndExclusive.getTime() - 1))}`;
 
   const [assignments, recordings, remoteCalls, followUps] = await Promise.all([
     LeadAssignment.find({ agentId, isActive: true }).select('leadId'),
     CallRecording.find({
       agentId,
       callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
-    }).select('leadId durationSeconds callOutcome clientCallId'),
+    }).select('leadId durationSeconds callOutcome clientCallId callStartTime'),
     RemoteCall.find({
       agentId,
       startTime: { $gte: rangeStart, $lt: rangeEndExclusive },
       status: { $in: ['ended', 'busy', 'rejected', 'failed', 'no_answer'] },
-    }).select('leadId durationSeconds status callId'),
+    }).select('leadId durationSeconds status callId startTime'),
     LeadFollowUp.find({
       agentId,
       createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
     })
-      .select('leadId remarks nextFollowupDate callOutcome leadResult clientCallId callRecordingId')
+      .select(
+        'leadId remarks nextFollowupDate callOutcome leadResult clientCallId callRecordingId createdAt'
+      )
       .populate(
         'leadId',
         'companyName leadCode leadStage leadStatus status quotationValue probabilityPercent orderValue state district city'
@@ -296,61 +295,84 @@ export async function buildDailySalesReport(
       ? await Lead.find({ _id: { $in: assignedLeadIds } }).select('state district city')
       : [];
 
-  // Map follow-up outcomes by recording id / client call id for preference.
   const fuByRecordingId = new Map<string, string>();
   const fuByClientCallId = new Map<string, string>();
-  const fuLeadKeysCounted = new Set<string>();
-
   for (const f of followUps) {
     const outcome = normalizeOutcome(f.callOutcome);
+    if (outcome === 'unknown') continue;
     if (f.callRecordingId) fuByRecordingId.set(f.callRecordingId.toString(), outcome);
     if (f.clientCallId) fuByClientCallId.set(f.clientCallId, outcome);
   }
 
   const bucket = emptyCallBuckets();
   const touchedLeadIds = new Set<string>();
-  const countedKeys = new Set<string>();
+  const countedClientIds = new Set<string>();
+  const countedRecordingIds = new Set<string>();
+  const dialTimesByLead = new Map<string, number[]>();
 
+  const markDial = (
+    leadKey: string,
+    startMs: number,
+    clientId?: string | null,
+    recordingId?: string | null
+  ) => {
+    if (clientId) countedClientIds.add(clientId);
+    if (recordingId) countedRecordingIds.add(recordingId);
+    if (!leadKey) return;
+    touchedLeadIds.add(leadKey);
+    const list = dialTimesByLead.get(leadKey) ?? [];
+    list.push(startMs);
+    dialTimesByLead.set(leadKey, list);
+  };
+
+  const alreadyDialedNear = (leadKey: string, startMs: number, windowMs = 5 * 60 * 1000) => {
+    const list = dialTimesByLead.get(leadKey);
+    if (!list || list.length === 0) return false;
+    return list.some((t) => Math.abs(t - startMs) <= windowMs);
+  };
+
+  // 1) Uploaded recordings (usually connected calls only — app skips no-answer uploads).
   for (const c of recordings) {
-    const id = c._id.toString();
     const leadKey = c.leadId?.toString() || '';
-    if (leadKey) touchedLeadIds.add(leadKey);
-    countedKeys.add(`rec:${id}`);
-    if (c.clientCallId) countedKeys.add(`client:${c.clientCallId}`);
-    const formOutcome = fuByRecordingId.get(id) || (c.clientCallId ? fuByClientCallId.get(c.clientCallId) : undefined);
+    const startMs = new Date(c.callStartTime).getTime();
+    const formOutcome =
+      fuByRecordingId.get(c._id.toString()) ||
+      (c.clientCallId ? fuByClientCallId.get(c.clientCallId) : undefined);
     classifyDial(bucket, formOutcome || c.callOutcome || 'unknown', c.durationSeconds || 0);
-    if (leadKey) fuLeadKeysCounted.add(leadKey);
+    markDial(leadKey, startMs, c.clientCallId, c._id.toString());
   }
 
+  // 2) Windows remote dials not already covered by a recording.
+  let remoteAdded = 0;
   for (const c of remoteCalls) {
     const callId = c.callId;
-    if (callId && countedKeys.has(`client:${callId}`)) continue;
+    if (callId && countedClientIds.has(callId)) continue;
     const leadKey = c.leadId?.toString() || '';
-    // Skip if a recording for same lead already counted and remote has no distinct client id match
-    if (callId) countedKeys.add(`client:${callId}`);
-    countedKeys.add(`remote:${c._id.toString()}`);
-    if (leadKey) touchedLeadIds.add(leadKey);
+    const startMs = new Date(c.startTime).getTime();
+    if (leadKey && alreadyDialedNear(leadKey, startMs)) continue;
+
     const formOutcome = callId ? fuByClientCallId.get(callId) : undefined;
     classifyDial(bucket, formOutcome || outcomeFromRemoteStatus(c.status), c.durationSeconds || 0);
+    markDial(leadKey, startMs, callId);
+    remoteAdded += 1;
   }
 
-  // Follow-ups that represent a call with no recording/remote row (common on Windows).
-  let followUpsAsCalls = 0;
+  // 3) Follow-up forms = dials that never got a recording (no answer / busy / wrong number / etc.).
+  let followUpDialsAdded = 0;
   for (const f of followUps) {
-    const clientId = f.clientCallId;
-    if (clientId && countedKeys.has(`client:${clientId}`)) continue;
-    if (f.callRecordingId && countedKeys.has(`rec:${f.callRecordingId.toString()}`)) continue;
-    const outcome = normalizeOutcome(f.callOutcome);
-    if (outcome === 'unknown') continue;
-    countedKeys.add(`fu:${f._id.toString()}`);
-    if (clientId) countedKeys.add(`client:${clientId}`);
+    const clientId = f.clientCallId?.trim() || '';
+    if (clientId && countedClientIds.has(clientId)) continue;
+    if (f.callRecordingId && countedRecordingIds.has(f.callRecordingId.toString())) continue;
+
     const leadKey = refLeadId(f.leadId);
-    if (leadKey) touchedLeadIds.add(leadKey);
-    classifyDial(bucket, outcome, 0);
-    followUpsAsCalls += 1;
+    const startMs = f.createdAt ? new Date(f.createdAt).getTime() : 0;
+    if (leadKey && startMs && alreadyDialedNear(leadKey, startMs)) continue;
+
+    classifyDial(bucket, f.callOutcome || 'unknown', 0);
+    markDial(leadKey, startMs || Date.now(), clientId || null);
+    followUpDialsAdded += 1;
   }
 
-  // Lead & sales from lead_result dropdown on follow-ups in range.
   let interested = 0;
   let notInterested = 0;
   let followUpRequired = 0;
@@ -360,9 +382,39 @@ export async function buildDailySalesReport(
   let nextFollowUps = 0;
   const keyRemarks: DailySalesReport['key_remarks'] = [];
   const valuedLeadIds = new Set<string>();
+  const latestResultByLead = new Map<string, string>();
 
   for (const f of followUps) {
-    const result = normalizeLeadResult(f.leadResult);
+    const leadKey = refLeadId(f.leadId);
+    if (leadKey) touchedLeadIds.add(leadKey);
+
+    const lead = f.leadId as unknown as {
+      companyName?: string;
+      leadCode?: string;
+      leadStage?: string;
+      leadStatus?: string;
+      status?: string;
+    } | null;
+
+    let result = normalizeLeadResult(f.leadResult);
+    if (!result) {
+      result = inferLeadResultFromLead(lead, f.nextFollowupDate != null);
+    }
+    if (result && leadKey) latestResultByLead.set(leadKey, result);
+
+    if (f.nextFollowupDate) nextFollowUps += 1;
+
+    const remarks = (f.remarks || '').trim();
+    if (remarks) {
+      keyRemarks.push({
+        company_name: lead?.companyName || '—',
+        remarks,
+        lead_code: lead?.leadCode ?? null,
+      });
+    }
+  }
+
+  for (const result of latestResultByLead.values()) {
     switch (result) {
       case 'interested':
         interested += 1;
@@ -385,21 +437,6 @@ export async function buildDailySalesReport(
       default:
         break;
     }
-
-    if (f.nextFollowupDate) nextFollowUps += 1;
-
-    const remarks = (f.remarks || '').trim();
-    if (remarks) {
-      const lead = f.leadId as unknown as { companyName?: string; leadCode?: string } | null;
-      keyRemarks.push({
-        company_name: lead?.companyName || '—',
-        remarks,
-        lead_code: lead?.leadCode ?? null,
-      });
-    }
-
-    const leadKey = refLeadId(f.leadId);
-    if (leadKey) touchedLeadIds.add(leadKey);
   }
 
   const touchedLeads =
@@ -465,10 +502,46 @@ export async function buildDailySalesReport(
     calls_detail_count: bucket.attempted,
     data_sources: {
       recordings: recordings.length,
-      remote_calls: remoteCalls.length,
-      follow_ups: followUpsAsCalls,
+      remote_calls: remoteAdded,
+      follow_ups: followUpDialsAdded,
     },
   };
+}
+
+function inferLeadResultFromLead(
+  lead: {
+    leadStage?: string | null;
+    leadStatus?: string | null;
+    status?: string | null;
+  } | null,
+  hasNextFollowUp: boolean
+): string | null {
+  if (!lead) return hasNextFollowUp ? 'follow_up_required' : null;
+  const stage = (lead.leadStage || '').trim();
+  const stageLower = stage.toLowerCase();
+  const status = (lead.leadStatus || '').trim().toLowerCase();
+  const legacy = (lead.status || '').trim().toLowerCase();
+
+  if (status === 'won' || stage === 'Order Confirmed' || legacy === 'converted') return 'closed';
+  if (status === 'lost' || stage === 'Lost' || legacy === 'not_interested') return 'not_interested';
+  if (stage === 'Quotation Given' || stageLower.includes('rate')) return 'rate_provided';
+  if (stage === 'Qualified Lead' || stageLower === 'qualified') return 'qualified';
+  if (hasNextFollowUp || legacy === 'follow_up' || stageLower.includes('follow')) {
+    return 'follow_up_required';
+  }
+  if (
+    ['Connected/Relevant', 'Negotiation', 'Order Expected', 'Contacted'].includes(stage) ||
+    legacy === 'interested' ||
+    stageLower === 'contacted' ||
+    stageLower.includes('interested')
+  ) {
+    return 'interested';
+  }
+  // Any other worked stage still surfaces on the report instead of blank zeros.
+  if (stage && !['not_contacted', 'new', 'raw'].includes(stageLower)) {
+    return hasNextFollowUp ? 'follow_up_required' : 'interested';
+  }
+  return hasNextFollowUp ? 'follow_up_required' : null;
 }
 
 /** @deprecated Prefer range overload via parseReportRange. */
