@@ -42,7 +42,7 @@ followUpsRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunct
 
     const followUps = await LeadFollowUp.find(filter)
       .sort({ nextFollowupDate: 1, createdAt: -1 })
-      .limit(500);
+      .limit(5000);
 
     const leadIds = [...new Set(followUps.map((f) => f.leadId.toString()))];
     const recordingIds = followUps
