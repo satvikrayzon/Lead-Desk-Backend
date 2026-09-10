@@ -164,11 +164,10 @@ export async function upsertLeadFollowUp(params: {
   return formatFollowUp(followUp, lead, recording);
 }
 
-/** Mirrors chained follow-ups onto legacy lead columns used by older exports/reports. */
+/** Mirrors chained follow-ups onto legacy lead columns used by older exports/reports.
+ * Uses $set on FU fields only so concurrent city/contact PATCHes are never overwritten.
+ */
 export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void> {
-  const lead = await Lead.findById(leadId);
-  if (!lead) return;
-
   const followUps = await LeadFollowUp.find({ leadId }).sort({ sequenceNumber: 1, createdAt: 1 });
   const bySeq = (n: number) => followUps.find((f) => (f.sequenceNumber ?? 0) === n);
 
@@ -178,30 +177,27 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
   const latest = followUps.length > 0 ? followUps[followUps.length - 1] : null;
   const scheduled = [...followUps].reverse().find((f) => f.nextFollowupDate);
 
-  if (f1) lead.followupRemarks = f1.remarks;
-  else if (latest) lead.followupRemarks = latest.remarks;
+  const $set: Record<string, unknown> = {
+    followup2: f2?.remarks,
+    followup2Date: f2?.createdAt,
+    followup3: f3?.remarks,
+    followup3Date: f3?.createdAt,
+    nextFollowupDate: scheduled?.nextFollowupDate,
+  };
 
-  lead.followup2 = f2?.remarks;
-  lead.followup2Date = f2?.createdAt;
-  lead.followup3 = f3?.remarks;
-  lead.followup3Date = f3?.createdAt;
+  if (f1) $set.followupRemarks = f1.remarks;
+  else if (latest) $set.followupRemarks = latest.remarks;
 
-  if (latest) lead.lastContactDate = latest.createdAt;
-  lead.nextFollowupDate = scheduled?.nextFollowupDate;
+  if (latest) $set.lastContactDate = latest.createdAt;
 
-  // Every saved follow-up after a dial (incl. no-answer / busy) counts toward Called.
   const dialFollowUps = followUps.filter((f) => {
     const o = (f.callOutcome || '').trim().toLowerCase();
     return Boolean(f.clientCallId) || (o.length > 0 && o !== 'unknown');
   });
   if (dialFollowUps.length > 0) {
-    lead.callCount = Math.max(lead.callCount ?? 0, dialFollowUps.length);
     const latestDial = dialFollowUps[dialFollowUps.length - 1];
-    if (latestDial.createdAt) {
-      if (!lead.lastCalledAt || latestDial.createdAt >= lead.lastCalledAt) {
-        lead.lastCalledAt = latestDial.createdAt;
-      }
-    }
+    $set.callCount = dialFollowUps.length;
+    if (latestDial.createdAt) $set.lastCalledAt = latestDial.createdAt;
   }
 
   const withFill = followUps.filter(
@@ -209,12 +205,27 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
   );
   if (withFill.length > 0) {
     const last = withFill[withFill.length - 1];
-    lead.lastFormFillSeconds = last.formFillSeconds;
+    $set.lastFormFillSeconds = last.formFillSeconds;
     const sum = withFill.reduce((acc, f) => acc + (f.formFillSeconds ?? 0), 0);
-    lead.avgFormFillSeconds = Math.round(sum / withFill.length);
+    $set.avgFormFillSeconds = Math.round(sum / withFill.length);
   }
 
-  await lead.save();
+  // Max callCount with existing value without loading full doc into a save race.
+  if ($set.callCount != null) {
+    const existing = await Lead.findById(leadId).select('callCount lastCalledAt').lean();
+    if (existing) {
+      $set.callCount = Math.max(existing.callCount ?? 0, $set.callCount as number);
+      if (
+        existing.lastCalledAt &&
+        $set.lastCalledAt instanceof Date &&
+        existing.lastCalledAt > $set.lastCalledAt
+      ) {
+        $set.lastCalledAt = existing.lastCalledAt;
+      }
+    }
+  }
+
+  await Lead.updateOne({ _id: leadId }, { $set });
 }
 
 followUpsRouter.post('/leads/:leadId', async (req: AuthRequest, res: Response, next: NextFunction) => {

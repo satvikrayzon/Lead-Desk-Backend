@@ -79,7 +79,7 @@ adminRouter.post('/leads', async (req: AuthRequest, res: Response, next: NextFun
       salesExecutive: agent.name,
       teamLeader: agent.teamName || undefined,
       leadStatus: 'open',
-      leadStage: 'not_contacted',
+      leadStage: 'Not Contacted',
       status: 'new',
       callCount: 0,
     });

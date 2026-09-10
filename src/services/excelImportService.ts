@@ -222,7 +222,7 @@ export async function importLeadsFromBuffer(params: {
           importBatchId: batch._id,
           importRowNumber: sheetSequence,
           leadStatus: 'open',
-          leadStage: 'not_contacted',
+          leadStage: 'Not Contacted',
           callCount: 0,
         },
       });

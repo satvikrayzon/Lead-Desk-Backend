@@ -567,7 +567,7 @@ function inferLeadResultFromLead(
     return 'interested';
   }
   // Any other worked stage still surfaces on the report instead of blank zeros.
-  if (stage && !['not_contacted', 'new', 'raw'].includes(stageLower)) {
+  if (stage && !['not contacted', 'no contacted', 'not_contacted', 'new', 'raw'].includes(stageLower)) {
     return hasNextFollowUp ? 'follow_up_required' : 'interested';
   }
   return hasNextFollowUp ? 'follow_up_required' : null;

@@ -353,6 +353,8 @@ const updateLeadSchema = z.object({
 
   city: z.union([z.string(), z.null()]).optional(),
 
+  contact_person: z.union([z.string(), z.null()]).optional(),
+
   designation: z.union([z.string(), z.null()]).optional(),
 
   customer_type: z.union([z.string(), z.null()]).optional(),
@@ -430,6 +432,12 @@ function applyFollowUpFields(lead: ILead, body: z.infer<typeof updateLeadSchema>
 
 
   if (body.city !== undefined) lead.city = str('city');
+
+  if (body.contact_person !== undefined) {
+    lead.contactPerson = str('contact_person');
+    // Keep legacy `name` in sync for list/search fallbacks.
+    if (lead.contactPerson) lead.name = lead.contactPerson;
+  }
 
   if (body.designation !== undefined) lead.designation = str('designation');
 
