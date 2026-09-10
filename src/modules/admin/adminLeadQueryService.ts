@@ -23,6 +23,7 @@ const LEAD_LITE_PROJECT = {
   callCount: 1,
   lastCalledAt: 1,
   createdAt: 1,
+  importRowNumber: 1,
 };
 
 function rawTabMatch(): Record<string, unknown> {
@@ -151,7 +152,37 @@ export async function queryAdminLeadsPage(input: {
     total: [{ $match: tabMatch }, { $count: 'n' }],
     pageKeys: [
       { $match: tabMatch },
-      { $sort: { assignedAt: -1 as const, 'lead._id': -1 as const } },
+      ...(tab === 'called'
+        ? [
+            {
+              $addFields: {
+                _lastCall: { $ifNull: ['$lead.lastCalledAt', '$assignedAt'] },
+              },
+            },
+            {
+              $sort: {
+                _lastCall: -1 as const,
+                assignedAt: -1 as const,
+                'lead._id': -1 as const,
+              },
+            },
+          ]
+        : [
+            {
+              $addFields: {
+                _row: { $ifNull: ['$lead.importRowNumber', 999999999] },
+                _created: { $ifNull: ['$lead.createdAt', '$assignedAt'] },
+              },
+            },
+            {
+              // Raw data: Excel top rows first (import row ascending).
+              $sort: {
+                _row: 1 as const,
+                _created: 1 as const,
+                'lead._id': 1 as const,
+              },
+            },
+          ]),
       { $skip: skip },
       { $limit: limit },
       { $project: { leadId: '$lead._id', assignedAt: 1, agentId: 1 } },

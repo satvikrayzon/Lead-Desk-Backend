@@ -140,8 +140,9 @@ function remainingSortStages(tomorrowStart: Date) {
       $sort: {
         _fuRank: 1 as const,
         'lead.nextFollowupDate': 1 as const,
-        _created: -1 as const,
+        // Excel / sheet order: row 1 at the top (not last-imported first).
         _row: 1 as const,
+        _created: 1 as const,
         'lead._id': 1 as const,
       },
     },
