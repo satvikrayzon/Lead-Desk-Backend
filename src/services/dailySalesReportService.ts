@@ -17,6 +17,10 @@ export type DailySalesReport = {
   target_area: string | null;
   calling: {
     calls_attempted: number;
+    /** First-time dials on raw / remaining leads. */
+    calls_from_raw_leads: number;
+    /** Re-dials / scheduled follow-up calls. */
+    calls_from_follow_ups: number;
     calls_connected: number;
     no_answer: number;
     busy_switched_off: number;
@@ -198,6 +202,8 @@ function refLeadId(ref: unknown): string {
 
 type CallBuckets = {
   attempted: number;
+  rawLeads: number;
+  followUpCalls: number;
   connected: number;
   noAnswer: number;
   busy: number;
@@ -209,6 +215,8 @@ type CallBuckets = {
 function emptyCallBuckets(): CallBuckets {
   return {
     attempted: 0,
+    rawLeads: 0,
+    followUpCalls: 0,
     connected: 0,
     noAnswer: 0,
     busy: 0,
@@ -219,8 +227,15 @@ function emptyCallBuckets(): CallBuckets {
 }
 
 /** Classify a single dial into report buckets (form outcome preferred). */
-function classifyDial(bucket: CallBuckets, outcomeRaw: string, talkSeconds = 0) {
+function classifyDial(
+  bucket: CallBuckets,
+  outcomeRaw: string,
+  talkSeconds = 0,
+  kind: 'raw' | 'follow_up' = 'raw'
+) {
   bucket.attempted += 1;
+  if (kind === 'follow_up') bucket.followUpCalls += 1;
+  else bucket.rawLeads += 1;
   bucket.talkSeconds += Math.max(0, talkSeconds);
   const outcome = normalizeOutcome(outcomeRaw);
   switch (outcome) {
@@ -265,12 +280,8 @@ export async function buildDailySalesReport(
       ? dateDisplay(rangeStart)
       : `${dateDisplay(rangeStart)} → ${dateDisplay(new Date(rangeEndExclusive.getTime() - 1))}`;
 
-  const [assignments, recordings, remoteCalls, followUps] = await Promise.all([
+  const [assignments, remoteCalls, followUps, priorCalledLeadIds, talkRecordings] = await Promise.all([
     LeadAssignment.find({ agentId, isActive: true }).select('leadId'),
-    CallRecording.find({
-      agentId,
-      callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
-    }).select('leadId durationSeconds callOutcome clientCallId callStartTime'),
     RemoteCall.find({
       agentId,
       startTime: { $gte: rangeStart, $lt: rangeEndExclusive },
@@ -281,12 +292,21 @@ export async function buildDailySalesReport(
       createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
     })
       .select(
-        'leadId remarks nextFollowupDate callOutcome leadResult clientCallId callRecordingId createdAt'
+        'leadId remarks nextFollowupDate callOutcome leadResult clientCallId callRecordingId createdAt sequenceNumber'
       )
       .populate(
         'leadId',
         'companyName leadCode leadStage leadStatus status quotationValue probabilityPercent orderValue state district city'
       ),
+    LeadFollowUp.distinct('leadId', {
+      agentId,
+      createdAt: { $lt: rangeStart },
+    }),
+    // Recordings exist only when the customer picked up — use for talk time only, never as dial attempts.
+    CallRecording.find({
+      agentId,
+      callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
+    }).select('durationSeconds clientCallId'),
   ]);
 
   const assignedLeadIds = assignments.map((a) => a.leadId);
@@ -295,31 +315,45 @@ export async function buildDailySalesReport(
       ? await Lead.find({ _id: { $in: assignedLeadIds } }).select('state district city')
       : [];
 
-  const fuByRecordingId = new Map<string, string>();
-  const fuByClientCallId = new Map<string, string>();
-  for (const f of followUps) {
-    const outcome = normalizeOutcome(f.callOutcome);
-    if (outcome === 'unknown') continue;
-    if (f.callRecordingId) fuByRecordingId.set(f.callRecordingId.toString(), outcome);
-    if (f.clientCallId) fuByClientCallId.set(f.clientCallId, outcome);
+  const priorCalled = new Set(priorCalledLeadIds.map((id) => id.toString()));
+  const priorRemotes = await RemoteCall.distinct('leadId', {
+    agentId,
+    startTime: { $lt: rangeStart },
+    status: { $in: ['ended', 'busy', 'rejected', 'failed', 'no_answer'] },
+  });
+  for (const id of priorRemotes) priorCalled.add(id.toString());
+
+  const talkByClientCallId = new Map<string, number>();
+  let orphanRecordingTalk = 0;
+  for (const r of talkRecordings) {
+    const secs = Math.max(0, r.durationSeconds || 0);
+    if (r.clientCallId) {
+      talkByClientCallId.set(
+        r.clientCallId,
+        Math.max(talkByClientCallId.get(r.clientCallId) ?? 0, secs)
+      );
+    } else {
+      orphanRecordingTalk += secs;
+    }
   }
 
   const bucket = emptyCallBuckets();
   const touchedLeadIds = new Set<string>();
   const countedClientIds = new Set<string>();
-  const countedRecordingIds = new Set<string>();
   const dialTimesByLead = new Map<string, number[]>();
+  const dialedInRange = new Set<string>();
 
-  const markDial = (
-    leadKey: string,
-    startMs: number,
-    clientId?: string | null,
-    recordingId?: string | null
-  ) => {
+  const resolveKind = (leadKey: string, sequence?: number): 'raw' | 'follow_up' => {
+    if (sequence != null && sequence > 1) return 'follow_up';
+    if (leadKey && (priorCalled.has(leadKey) || dialedInRange.has(leadKey))) return 'follow_up';
+    return 'raw';
+  };
+
+  const markDial = (leadKey: string, startMs: number, clientId?: string | null) => {
     if (clientId) countedClientIds.add(clientId);
-    if (recordingId) countedRecordingIds.add(recordingId);
     if (!leadKey) return;
     touchedLeadIds.add(leadKey);
+    dialedInRange.add(leadKey);
     const list = dialTimesByLead.get(leadKey) ?? [];
     list.push(startMs);
     dialTimesByLead.set(leadKey, list);
@@ -331,18 +365,21 @@ export async function buildDailySalesReport(
     return list.some((t) => Math.abs(t - startMs) <= windowMs);
   };
 
-  // 1) Uploaded recordings (usually connected calls only — app skips no-answer uploads).
-  for (const c of recordings) {
-    const leadKey = c.leadId?.toString() || '';
-    const startMs = new Date(c.callStartTime).getTime();
-    const formOutcome =
-      fuByRecordingId.get(c._id.toString()) ||
-      (c.clientCallId ? fuByClientCallId.get(c.clientCallId) : undefined);
-    classifyDial(bucket, formOutcome || c.callOutcome || 'unknown', c.durationSeconds || 0);
-    markDial(leadKey, startMs, c.clientCallId, c._id.toString());
+  // 1) Follow-up forms = source of truth for every dial (connected, no answer, busy, wrong number).
+  let followUpDialsAdded = 0;
+  for (const f of followUps) {
+    const leadKey = refLeadId(f.leadId);
+    const startMs = f.createdAt ? new Date(f.createdAt).getTime() : Date.now();
+    const clientId = f.clientCallId?.trim() || '';
+    const kind = resolveKind(leadKey, Math.max(1, f.sequenceNumber ?? 1));
+    const talk =
+      (clientId ? talkByClientCallId.get(clientId) : undefined) ?? 0;
+    classifyDial(bucket, f.callOutcome || 'unknown', talk, kind);
+    markDial(leadKey, startMs, clientId || null);
+    followUpDialsAdded += 1;
   }
 
-  // 2) Windows remote dials not already covered by a recording.
+  // 2) Windows remote dials with no follow-up form yet (still count the attempt).
   let remoteAdded = 0;
   for (const c of remoteCalls) {
     const callId = c.callId;
@@ -351,26 +388,16 @@ export async function buildDailySalesReport(
     const startMs = new Date(c.startTime).getTime();
     if (leadKey && alreadyDialedNear(leadKey, startMs)) continue;
 
-    const formOutcome = callId ? fuByClientCallId.get(callId) : undefined;
-    classifyDial(bucket, formOutcome || outcomeFromRemoteStatus(c.status), c.durationSeconds || 0);
+    const kind = resolveKind(leadKey);
+    const talk = Math.max(0, c.durationSeconds || 0);
+    classifyDial(bucket, outcomeFromRemoteStatus(c.status), talk, kind);
     markDial(leadKey, startMs, callId);
     remoteAdded += 1;
   }
 
-  // 3) Follow-up forms = dials that never got a recording (no answer / busy / wrong number / etc.).
-  let followUpDialsAdded = 0;
-  for (const f of followUps) {
-    const clientId = f.clientCallId?.trim() || '';
-    if (clientId && countedClientIds.has(clientId)) continue;
-    if (f.callRecordingId && countedRecordingIds.has(f.callRecordingId.toString())) continue;
-
-    const leadKey = refLeadId(f.leadId);
-    const startMs = f.createdAt ? new Date(f.createdAt).getTime() : 0;
-    if (leadKey && startMs && alreadyDialedNear(leadKey, startMs)) continue;
-
-    classifyDial(bucket, f.callOutcome || 'unknown', 0);
-    markDial(leadKey, startMs || Date.now(), clientId || null);
-    followUpDialsAdded += 1;
+  // Recordings never add dials — only optional talk already applied above via clientCallId.
+  if (orphanRecordingTalk > 0 && bucket.attempted > 0) {
+    bucket.talkSeconds += orphanRecordingTalk;
   }
 
   let interested = 0;
@@ -478,6 +505,8 @@ export async function buildDailySalesReport(
     target_area: targetArea,
     calling: {
       calls_attempted: bucket.attempted,
+      calls_from_raw_leads: bucket.rawLeads,
+      calls_from_follow_ups: bucket.followUpCalls,
       calls_connected: bucket.connected,
       no_answer: bucket.noAnswer,
       busy_switched_off: bucket.busy,
@@ -501,7 +530,7 @@ export async function buildDailySalesReport(
     talk_seconds: bucket.talkSeconds,
     calls_detail_count: bucket.attempted,
     data_sources: {
-      recordings: recordings.length,
+      recordings: talkRecordings.length,
       remote_calls: remoteAdded,
       follow_ups: followUpDialsAdded,
     },
@@ -570,15 +599,6 @@ export async function buildAllDailySalesReports(
 export function formatDailySalesReportText(report: DailySalesReport): string {
   const c = report.calling;
   const s = report.lead_sales;
-  const remarks =
-    report.key_remarks.length === 0
-      ? '—'
-      : report.key_remarks
-          .map((r) => {
-            const code = r.lead_code ? ` (${r.lead_code})` : '';
-            return `• ${r.company_name}${code}: ${r.remarks}`;
-          })
-          .join('\n');
 
   return [
     '📊 DAILY SALES TELECALLING REPORT',
@@ -591,6 +611,8 @@ export function formatDailySalesReportText(report: DailySalesReport): string {
     '📞 CALLING PERFORMANCE',
     '',
     `• Calls Attempted: ${c.calls_attempted}`,
+    `   - From raw leads: ${c.calls_from_raw_leads}`,
+    `   - Follow-up calls: ${c.calls_from_follow_ups}`,
     `• Calls Connected: ${c.calls_connected}`,
     `• No Answer: ${c.no_answer}`,
     `• Busy/Switched Off: ${c.busy_switched_off}`,
@@ -612,10 +634,6 @@ export function formatDailySalesReportText(report: DailySalesReport): string {
     '📅 NEXT FOLLOW-UP',
     '',
     `• Total Follow-up Calls: ${report.next_follow_up.total_follow_up_calls}`,
-    '',
-    '',
-    '📝 KEY REMARKS',
-    remarks,
   ].join('\n');
 }
 
@@ -633,6 +651,8 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
     { header: 'State/Region', key: 'state', width: 16 },
     { header: 'Target Area', key: 'area', width: 16 },
     { header: 'Calls Attempted', key: 'attempted', width: 14 },
+    { header: 'Raw Lead Calls', key: 'rawCalls', width: 14 },
+    { header: 'Follow-up Calls', key: 'fuCalls', width: 14 },
     { header: 'Calls Connected', key: 'connected', width: 14 },
     { header: 'No Answer', key: 'noAnswer', width: 12 },
     { header: 'Busy/Switched Off', key: 'busy', width: 16 },
@@ -657,6 +677,8 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
       state: r.state_region || '',
       area: r.target_area || '',
       attempted: r.calling.calls_attempted,
+      rawCalls: r.calling.calls_from_raw_leads,
+      fuCalls: r.calling.calls_from_follow_ups,
       connected: r.calling.calls_connected,
       noAnswer: r.calling.no_answer,
       busy: r.calling.busy_switched_off,

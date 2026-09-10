@@ -13,6 +13,7 @@ import {
   formatDailySalesReportText,
   parseReportRange,
 } from '../../services/dailySalesReportService';
+import { buildTelecallerPerformanceDashboard } from '../../services/telecallerPerformanceService';
 
 export const adminDashboardRouter = Router();
 
@@ -391,6 +392,24 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     next(err);
   }
 });
+
+/** Same My Performance dashboard payload for one telecaller (admin view). */
+adminDashboardRouter.get(
+  '/telecallers/:userId/performance',
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
+    try {
+      const userId = String(req.params.userId || '');
+      if (!Types.ObjectId.isValid(userId)) throw new AppError(400, 'Invalid user id.');
+      const data = await buildTelecallerPerformanceDashboard(userId);
+      res.json({ data });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'Telecaller not found') {
+        return next(new AppError(404, err.message));
+      }
+      next(err);
+    }
+  }
+);
 
 /** Detailed daily report for one telecaller (calls + talk time). */
 adminDashboardRouter.get(
