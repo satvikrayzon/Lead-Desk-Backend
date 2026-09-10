@@ -1,4 +1,4 @@
-import { CallRecording, LeadAssignment, LeadFollowUp, RemoteCall, User } from '../models';
+import { CallRecording, Lead, LeadAssignment, LeadFollowUp, RemoteCall, User } from '../models';
 import { ILead } from '../models/Lead';
 import { buildDailySalesReport } from './dailySalesReportService';
 import { countAgentTabTotals } from '../modules/leads/leadListFilters';
@@ -135,6 +135,35 @@ function mergeDials(
 
   events.sort((a, b) => b.startTime.getTime() - a.startTime.getTime());
   return events;
+}
+
+/** Fill company / contact / phone from Lead docs (mergeDials leaves placeholders). */
+async function attachLeadDetails(events: DialEvent[]): Promise<DialEvent[]> {
+  const ids = [...new Set(events.map((e) => e.leadId).filter(Boolean))];
+  if (ids.length === 0) return events;
+
+  const leads = await Lead.find({ _id: { $in: ids } })
+    .select('companyName company name contactPerson contactMobile phoneNumber leadCode')
+    .lean();
+  const byId = new Map(leads.map((l) => [String(l._id), l]));
+
+  return events.map((e) => {
+    const lead = byId.get(e.leadId);
+    if (!lead) return e;
+    const company =
+      (lead.companyName || lead.company || lead.name || '').trim() || e.companyName || '—';
+    return {
+      ...e,
+      companyName: company,
+      contactPerson: lead.contactPerson ?? e.contactPerson,
+      leadCode: lead.leadCode ?? e.leadCode,
+      phoneNumber:
+        e.phoneNumber?.trim() ||
+        lead.contactMobile ||
+        lead.phoneNumber ||
+        '',
+    };
+  });
 }
 
 /** Same performance payload for telecaller "My Performance" and admin drill-down. */
@@ -284,7 +313,7 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
   const followUpsToday = followUpsTodayDocs.length;
   const followUpsWeek = followUpsWeekDocs.length;
 
-  const recentCalls = dialsToday.slice(0, 25).map((c) => ({
+  const recentCalls = (await attachLeadDetails(dialsToday.slice(0, 25))).map((c) => ({
     id: c.id,
     lead_id: c.leadId,
     company_name: c.companyName,
@@ -465,4 +494,91 @@ export async function loadCompanyDials(
   }
 
   return rows;
+}
+
+/**
+ * Agent Call History for the app (Windows has no local SQLite — must use server dials).
+ * Returns newest-first rows shaped like lead call recordings for the Flutter client.
+ */
+export async function listAgentCallHistory(userId: string, limit = 150) {
+  const since = daysAgoIst(60);
+  const [remotes, followUps, talkRecordings] = await Promise.all([
+    RemoteCall.find({
+      agentId: userId,
+      status: { $in: [...REMOTE_TERMINAL] },
+      startTime: { $gte: since },
+    })
+      .sort({ startTime: -1 })
+      .limit(limit * 2)
+      .lean(),
+    LeadFollowUp.find({
+      agentId: userId,
+      createdAt: { $gte: since },
+    })
+      .sort({ createdAt: -1 })
+      .limit(limit * 2)
+      .lean(),
+    CallRecording.find({
+      agentId: userId,
+      callStartTime: { $gte: since },
+    })
+      .select('clientCallId durationSeconds uploadStatus _id')
+      .lean(),
+  ]);
+
+  const talkByClient = new Map<string, number>();
+  const recordingByClient = new Map<string, { id: string; uploaded: boolean }>();
+  for (const r of talkRecordings) {
+    if (!r.clientCallId) continue;
+    const secs = Math.max(0, r.durationSeconds || 0);
+    talkByClient.set(r.clientCallId, Math.max(talkByClient.get(r.clientCallId) ?? 0, secs));
+    recordingByClient.set(r.clientCallId, {
+      id: r._id.toString(),
+      uploaded: r.uploadStatus === 'uploaded',
+    });
+  }
+
+  const dials = await attachLeadDetails(
+    mergeDials(
+      remotes.map((c) => ({
+        _id: c._id,
+        callId: c.callId,
+        leadId: c.leadId,
+        phoneNumber: c.phoneNumber,
+        startTime: c.startTime,
+        endTime: c.endTime,
+        durationSeconds: c.durationSeconds,
+        status: c.status,
+      })),
+      followUps.map((f) => ({
+        _id: f._id,
+        leadId: f.leadId,
+        clientCallId: f.clientCallId,
+        callRecordingId: f.callRecordingId,
+        callOutcome: f.callOutcome,
+        createdAt: f.createdAt,
+      })),
+      talkByClient
+    )
+  );
+
+  return dials.slice(0, Math.max(1, Math.min(500, limit))).map((c) => {
+    const rec = c.clientCallId ? recordingByClient.get(c.clientCallId) : undefined;
+    return {
+      id: c.id,
+      lead_id: c.leadId,
+      company_name: c.companyName,
+      contact_person: c.contactPerson,
+      lead_code: c.leadCode,
+      phone_number: c.phoneNumber,
+      call_start_time: c.startTime.toISOString(),
+      call_end_time: c.endTime?.toISOString() ?? null,
+      duration_seconds: c.durationSeconds,
+      call_outcome: c.callOutcome,
+      client_call_id: c.clientCallId ?? null,
+      source: c.source,
+      recording_id: rec?.id ?? null,
+      recording_url: rec?.uploaded ? `recordings/${rec.id}/file` : null,
+    };
+  });
 }

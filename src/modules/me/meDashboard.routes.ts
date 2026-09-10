@@ -7,9 +7,23 @@ import {
   formatDailySalesReportText,
   parseReportRange,
 } from '../../services/dailySalesReportService';
-import { buildTelecallerPerformanceDashboard } from '../../services/telecallerPerformanceService';
+import { buildTelecallerPerformanceDashboard, listAgentCallHistory } from '../../services/telecallerPerformanceService';
 
 export const meDashboardRouter = Router();
+
+/** Logged-in agent's call history (server dials — required on Windows with no local DB). */
+meDashboardRouter.get('/calls', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) throw new AppError(401, 'Authentication required.');
+    const parsed = parseInt(String(req.query.limit ?? ''), 10);
+    const limit = Math.min(500, Math.max(1, Number.isFinite(parsed) ? parsed : 150));
+    const data = await listAgentCallHistory(userId, limit);
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /** Logged-in telecaller / team leader personal performance dashboard. */
 meDashboardRouter.get('/dashboard', async (req: AuthRequest, res: Response, next: NextFunction) => {
