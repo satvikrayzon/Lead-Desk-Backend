@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
 import { Types } from 'mongoose';
 import { Lead, LeadAssignment, LeadImportBatch } from '../models';
+import { assignmentInsertFromLead } from './assignmentListSync';
 import { ImportErrorRow } from '../models/LeadImportBatch';
 
 const HEADER_MAP: Record<string, string> = {
@@ -265,13 +266,14 @@ export async function importLeadsFromBuffer(params: {
 
       if (inserted.length > 0) {
         await LeadAssignment.insertMany(
-          inserted.map((lead) => ({
-            leadId: lead._id,
-            agentId: assignTo,
-            assignedBy: uploadedBy,
-            isActive: true,
-            assignedAt: new Date(),
-          })),
+          inserted.map((lead) =>
+            assignmentInsertFromLead({
+              lead,
+              agentId: assignTo,
+              assignedBy: uploadedBy,
+              assignedAt: new Date(),
+            })
+          ),
           { ordered: false },
         );
       }
@@ -289,13 +291,14 @@ export async function importLeadsFromBuffer(params: {
         createdCount += insertedDocs.length;
         try {
           await LeadAssignment.insertMany(
-            insertedDocs.map((lead) => ({
-              leadId: lead._id,
-              agentId: assignTo,
-              assignedBy: uploadedBy,
-              isActive: true,
-              assignedAt: new Date(),
-            })),
+            insertedDocs.map((lead) =>
+              assignmentInsertFromLead({
+                lead: lead as { _id: Types.ObjectId },
+                agentId: assignTo,
+                assignedBy: uploadedBy,
+                assignedAt: new Date(),
+              })
+            ),
             { ordered: false },
           );
         } catch (_) {

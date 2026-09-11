@@ -12,6 +12,7 @@ import { adminUsersRouter } from './adminUsers.routes';
 import { adminTeamsRouter } from './adminTeams.routes';
 import { adminDashboardRouter } from './adminDashboard.routes';
 import { queryAdminLeadsPage } from './adminLeadQueryService';
+import { assignmentInsertFromLead } from '../../services/assignmentListSync';
 
 export const adminRouter = Router();
 
@@ -84,13 +85,14 @@ adminRouter.post('/leads', async (req: AuthRequest, res: Response, next: NextFun
       callCount: 0,
     });
 
-    const assignment = await LeadAssignment.create({
-      leadId: lead._id,
-      agentId: assignToUserId,
-      assignedBy: req.user!.id,
-      assignedAt: new Date(),
-      isActive: true,
-    });
+    const assignment = await LeadAssignment.create(
+      assignmentInsertFromLead({
+        lead,
+        agentId: assignToUserId,
+        assignedBy: req.user!.id,
+        assignedAt: new Date(),
+      })
+    );
 
     await createAuditLog({
       userId: req.user!.id,

@@ -1,6 +1,7 @@
 import { Router, Response, NextFunction } from 'express';
 import { createReadStream, statSync } from 'fs';
 import { CallRecording, Lead } from '../../models';
+import { syncAssignmentsForLead } from '../../services/assignmentListSync';
 import { linkFollowUpsToRecording } from '../../utils/linkFollowUpRecording';
 import { env } from '../../config/env';
 import { uploadToS3, deleteFromS3, getPresignedUrl } from '../../config/s3';
@@ -238,6 +239,7 @@ recordingsRouter.post(
           lastCalledAt: callEndTime,
         },
       });
+      await syncAssignmentsForLead(lead_id);
 
       if (client_call_id) {
         await linkFollowUpsToRecording(client_call_id, recording._id);

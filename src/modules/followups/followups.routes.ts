@@ -9,6 +9,7 @@ import { formatFollowUp } from '../../utils/followUpFormat';
 import { ILeadFollowUp } from '../../models/LeadFollowUp';
 import { ILead } from '../../models/Lead';
 import { invalidateDashboards } from '../../services/dashboardCache';
+import { syncAssignmentsForLead } from '../../services/assignmentListSync';
 
 export const followUpsRouter = Router();
 
@@ -251,6 +252,7 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
   if (Object.keys($unset).length) update.$unset = $unset;
   if (Object.keys(update).length) {
     await Lead.updateOne({ _id: leadId }, update);
+    await syncAssignmentsForLead(leadId);
   }
 }
 

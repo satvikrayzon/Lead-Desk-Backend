@@ -1,13 +1,40 @@
-import { FilterQuery, Types } from 'mongoose';
-import { Lead, LeadFollowUp, User } from '../../models';
+import { Types } from 'mongoose';
+import { Lead, LeadAssignment, LeadFollowUp, User } from '../../models';
 import { ILead } from '../../models/Lead';
 import { formatLead } from '../../utils/helpers';
 import { dateKeyIst, startOfIstDay } from '../../utils/istCalendar';
-import { calledTabMongo, loadAssignmentIndex, neverWorkedMongo } from '../../services/assignmentLeadLite';
+import { ensureAssignmentListBackfill } from '../../services/assignmentListSync';
 import { AgentLeadQuery } from './leadListFilters';
 
 function tomorrowIst(): Date {
   return new Date(startOfIstDay().getTime() + 24 * 60 * 60 * 1000);
+}
+
+function escapeRegex(raw: string): string {
+  return raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function applyAssignmentFilters(match: Record<string, unknown>, query: AgentLeadQuery): void {
+  if (query.lead_status) match.leadStatus = query.lead_status;
+  if (query.lead_stage) match.leadStage = query.lead_stage;
+  if (query.priority) match.priority = query.priority;
+  if (query.customer_type) match.customerType = query.customer_type;
+  if (query.product) match.product = query.product;
+  if (query.state) match.state = query.state;
+  if (query.district) match.district = query.district;
+  if (query.city) match.city = query.city;
+  if (query.search?.trim()) {
+    const rx = { $regex: escapeRegex(query.search.trim()), $options: 'i' };
+    match.$or = [
+      { companyName: rx },
+      { contactPerson: rx },
+      { contactMobile: rx },
+      { leadCode: rx },
+      { state: rx },
+      { district: rx },
+      { city: rx },
+    ];
+  }
 }
 
 type DueFollowUp = { leadId: Types.ObjectId; nextFollowupDate: Date; overdue: boolean };
@@ -46,38 +73,6 @@ async function loadDueFollowUpsForAgent(agentObjectId: Types.ObjectId): Promise<
   }));
 }
 
-function applyLeadFieldFilters(match: FilterQuery<ILead>, query: AgentLeadQuery, legacyStatus?: string) {
-  if (query.lead_status) match.leadStatus = query.lead_status;
-  if (query.lead_stage) match.leadStage = query.lead_stage;
-  if (query.priority) match.priority = query.priority;
-  if (query.customer_type) match.customerType = query.customer_type;
-  if (query.product) match.product = query.product;
-  if (query.state) match.state = query.state;
-  if (query.district) match.district = query.district;
-  if (query.city) match.city = query.city;
-  if (legacyStatus) match.status = legacyStatus;
-}
-
-function searchMongo(search?: string): FilterQuery<ILead> | null {
-  if (!search?.trim()) return null;
-  const term = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const rx = { $regex: term, $options: 'i' };
-  return {
-    $or: [
-      { name: rx },
-      { phoneNumber: rx },
-      { companyName: rx },
-      { company: rx },
-      { contactPerson: rx },
-      { contactMobile: rx },
-      { state: rx },
-      { district: rx },
-      { city: rx },
-      { leadCode: rx },
-    ],
-  };
-}
-
 export async function queryAgentLeadsPage(input: {
   userId: string;
   page: number;
@@ -96,80 +91,52 @@ export async function queryAgentLeadsPage(input: {
     called_count?: number;
   };
 }> {
-  const { userId, page, limit, query, legacyStatus } = input;
+  const { userId, page, limit, query } = input;
   const includeCounts = input.includeCounts !== false;
   const agentObjectId = new Types.ObjectId(userId);
   const skip = (page - 1) * limit;
   const tab = query.tab === 'called' ? 'called' : 'remaining';
 
-  const [dueFollowUps, assignments, agent] = await Promise.all([
+  await ensureAssignmentListBackfill();
+
+  const [dueFollowUps, agent] = await Promise.all([
     loadDueFollowUpsForAgent(agentObjectId),
-    loadAssignmentIndex({ agentId: agentObjectId, isActive: true }),
     User.findById(userId).select('name email teamName').lean(),
   ]);
 
-  if (assignments.length === 0) {
-    return {
-      data: [],
-      meta: {
-        page,
-        limit,
-        total: 0,
-        total_pages: 1,
-        remaining_count: includeCounts ? 0 : undefined,
-        called_count: includeCounts ? 0 : undefined,
-      },
-    };
-  }
-
-  const assignByLead = new Map(assignments.map((a) => [String(a.leadId), a]));
-  const leadIds = assignments.map((a) => a.leadId);
   const dueIds = dueFollowUps.map((d) => d.leadId);
   const dueDateByLead = new Map(dueFollowUps.map((d) => [String(d.leadId), d.nextFollowupDate]));
-  const overdueIds = dueFollowUps.filter((d) => d.overdue).map((d) => d.leadId);
-  const dueTodayIds = dueFollowUps.filter((d) => !d.overdue).map((d) => d.leadId);
+  const overdueIdSet = new Set(dueFollowUps.filter((d) => d.overdue).map((d) => String(d.leadId)));
+  const dueTodayIdSet = new Set(dueFollowUps.filter((d) => !d.overdue).map((d) => String(d.leadId)));
 
-  const base: FilterQuery<ILead> = { _id: { $in: leadIds } };
-  applyLeadFieldFilters(base, query, legacyStatus);
-  const search = searchMongo(query.search);
-  const extras: FilterQuery<ILead>[] = [];
-  if (search) extras.push(search);
+  const base: Record<string, unknown> = { isActive: true, agentId: agentObjectId };
+  applyAssignmentFilters(base, query);
 
-  const remainingTab =
+  const remainingClause: Record<string, unknown> =
     dueIds.length === 0
-      ? neverWorkedMongo()
-      : { $or: [neverWorkedMongo(), { _id: { $in: dueIds } }] };
-
-  const withExtras = (tabMatch: FilterQuery<ILead>): FilterQuery<ILead> => {
-    const parts = [base, tabMatch, ...extras];
-    return { $and: parts };
-  };
-
-  const remainingMatch = withExtras(remainingTab);
-  const calledMatch = withExtras({
-    $or: [{ callCount: { $gt: 0 } }, { lastCalledAt: { $ne: null } }],
-  });
+      ? { callCount: { $lte: 0 } }
+      : { $or: [{ callCount: { $lte: 0 } }, { leadId: { $in: dueIds } }] };
+  const remainingMatch = { $and: [base, remainingClause] };
+  const calledMatch = { $and: [base, { callCount: { $gt: 0 } }] };
   const tabMatch = tab === 'called' ? calledMatch : remainingMatch;
 
-  const [total, remainingCount, calledCount, pageLeads] = await Promise.all([
-    Lead.countDocuments(tabMatch),
-    includeCounts ? Lead.countDocuments(remainingMatch) : Promise.resolve(0),
-    includeCounts ? Lead.countDocuments(calledMatch) : Promise.resolve(0),
+  const [pageRows, total, remainingCount, calledCount] = await Promise.all([
     tab === 'called'
-      ? Lead.find(tabMatch)
+      ? LeadAssignment.find(tabMatch)
+          .select('leadId agentId assignedAt')
           .sort({ lastCalledAt: -1, _id: -1 })
           .skip(skip)
           .limit(limit)
-          .lean<ILead[]>()
-      : Lead.aggregate<ILead>([
+          .lean()
+      : LeadAssignment.aggregate<{ leadId: Types.ObjectId; agentId: Types.ObjectId; assignedAt: Date }>([
           { $match: tabMatch },
           {
             $addFields: {
               _fuRank: {
                 $switch: {
                   branches: [
-                    { case: { $in: ['$_id', overdueIds] }, then: 0 },
-                    { case: { $in: ['$_id', dueTodayIds] }, then: 1 },
+                    { case: { $in: ['$leadId', [...overdueIdSet].map((id) => new Types.ObjectId(id))] }, then: 0 },
+                    { case: { $in: ['$leadId', [...dueTodayIdSet].map((id) => new Types.ObjectId(id))] }, then: 1 },
                   ],
                   default: 2,
                 },
@@ -177,17 +144,28 @@ export async function queryAgentLeadsPage(input: {
               _row: { $ifNull: ['$importRowNumber', 999999999] },
             },
           },
-          { $sort: { _fuRank: 1, nextFollowupDate: 1, _row: 1, createdAt: 1, _id: 1 } },
+          { $sort: { _fuRank: 1, nextFollowupDate: 1, _row: 1, assignedAt: 1, _id: 1 } },
           { $skip: skip },
           { $limit: limit },
+          { $project: { leadId: 1, agentId: 1, assignedAt: 1 } },
         ]),
+    LeadAssignment.countDocuments(tabMatch),
+    includeCounts ? LeadAssignment.countDocuments(remainingMatch) : Promise.resolve(0),
+    includeCounts ? LeadAssignment.countDocuments(calledMatch) : Promise.resolve(0),
   ]);
 
-  const data = pageLeads
-    .map((lead) => {
-      const row = assignByLead.get(String(lead._id));
-      if (!row) return null;
-      const synced = dueDateByLead.get(String(lead._id));
+  const leadIds = pageRows.map((r) => r.leadId);
+  const leadDocs =
+    leadIds.length === 0 ? ([] as ILead[]) : await Lead.find({ _id: { $in: leadIds } }).lean<ILead[]>();
+  const leadById = new Map(leadDocs.map((l) => [String(l._id), l]));
+  const assignByLead = new Map(pageRows.map((r) => [String(r.leadId), r]));
+
+  const data = leadIds
+    .map((id) => {
+      const lead = leadById.get(String(id));
+      const row = assignByLead.get(String(id));
+      if (!lead || !row) return null;
+      const synced = dueDateByLead.get(String(id));
       if (synced) lead.nextFollowupDate = synced;
       return formatLead(lead as ILead, row.assignedAt, agent as never);
     })
@@ -207,25 +185,8 @@ export async function queryAgentLeadsPage(input: {
 }
 
 export async function queryAgentFilterOptions(userId: string) {
-  const assignments = await loadAssignmentIndex({
-    agentId: new Types.ObjectId(userId),
-    isActive: true,
-  });
-  const leadIds = assignments.map((a) => a.leadId);
-  if (leadIds.length === 0) {
-    return {
-      states: [],
-      districts: [],
-      cities: [],
-      lead_statuses: [],
-      lead_stages: [],
-      priorities: [],
-      customer_types: [],
-      products: [],
-    };
-  }
-
-  const rows = await Lead.aggregate<{
+  await ensureAssignmentListBackfill();
+  const rows = await LeadAssignment.aggregate<{
     states: string[];
     districts: string[];
     cities: string[];
@@ -235,7 +196,7 @@ export async function queryAgentFilterOptions(userId: string) {
     customer_types: string[];
     products: string[];
   }>([
-    { $match: { _id: { $in: leadIds } } },
+    { $match: { isActive: true, agentId: new Types.ObjectId(userId) } },
     {
       $group: {
         _id: null,
@@ -264,6 +225,7 @@ export async function queryAgentFilterOptions(userId: string) {
     customer_types: [],
     products: [],
   };
+
   return {
     states: uniq(g.states),
     districts: uniq(g.districts),

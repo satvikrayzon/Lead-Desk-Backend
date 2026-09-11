@@ -2,6 +2,7 @@ import http from 'http';
 import { createApp } from './app';
 import { env } from './config/env';
 import { connectDatabase } from './config/database';
+import { ensureAssignmentListBackfill } from './services/assignmentListSync';
 import { createSocketServer } from './socket/remoteCallSocket';
 import { setSocketServer } from './services/realtimeNotify';
 
@@ -11,6 +12,9 @@ const httpServer = http.createServer(app);
 async function start() {
   try {
     await connectDatabase();
+    void ensureAssignmentListBackfill().catch((err) => {
+      console.warn('[leads] assignment list backfill failed', err instanceof Error ? err.message : err);
+    });
     const io = createSocketServer(httpServer);
     setSocketServer(io);
     httpServer.listen(env.PORT, () => {

@@ -233,6 +233,13 @@ export async function applyCallStatus(
         $inc: { callCount: 1 },
         $set: { lastCalledAt: call.endTime },
       });
+      await LeadAssignment.updateMany(
+        { leadId: call.leadId, isActive: true },
+        {
+          $inc: { callCount: 1 },
+          $set: { lastCalledAt: call.endTime, listSyncedAt: new Date() },
+        }
+      );
     }
   }
 

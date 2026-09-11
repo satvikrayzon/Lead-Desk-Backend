@@ -5,6 +5,7 @@ import { CallRecording, Lead, LeadAssignment, LeadFollowUp, User } from '../../m
 import { AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { createAuditLog, formatLead } from '../../utils/helpers';
+import { assignmentInsertFromLead, listFieldsFromAssignment } from '../../services/assignmentListSync';
 import { toApiRole } from '../../utils/roleMapping';
 import { dateKeyIst, daysAgoIst, startOfIstDay } from '../../utils/istCalendar';
 import {
@@ -649,13 +650,14 @@ adminDashboardRouter.post('/transfer-lead', async (req: AuthRequest, res: Respon
       await current.save();
     }
 
-    const assignment = await LeadAssignment.create({
-      leadId,
-      agentId: toUserId,
-      assignedBy: req.user!.id,
-      assignedAt: new Date(),
-      isActive: true,
-    });
+    const assignment = await LeadAssignment.create(
+      assignmentInsertFromLead({
+        lead,
+        agentId: toUserId,
+        assignedBy: req.user!.id,
+        assignedAt: new Date(),
+      })
+    );
 
     await createAuditLog({
       userId: req.user!.id,
@@ -731,6 +733,7 @@ adminDashboardRouter.post('/transfer-leads', async (req: AuthRequest, res: Respo
         assignedBy: req.user!.id,
         assignedAt: new Date(),
         isActive: true,
+        ...listFieldsFromAssignment(current),
       });
       transferredCount += 1;
     }
