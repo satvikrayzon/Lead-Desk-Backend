@@ -15,6 +15,7 @@ const startSchema = z.object({
   lead_id: z.string().min(1),
   phone_number: z.string().min(1),
   lead_name: z.string().optional(),
+  direction: z.enum(['incoming', 'outgoing']).optional(),
 });
 
 /** Phone app: call connected — notify this agent's desktop listeners. */
@@ -28,6 +29,7 @@ callSessionsRouter.post('/start', async (req: AuthRequest, res: Response, next: 
       leadId: parsed.data.lead_id,
       leadName: parsed.data.lead_name ?? 'Unknown lead',
       phoneNumber: parsed.data.phone_number,
+      direction: parsed.data.direction,
     });
 
     res.status(201).json({ data: session });

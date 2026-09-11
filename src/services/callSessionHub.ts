@@ -8,6 +8,8 @@ export interface ActiveCallSession {
   leadName: string;
   phoneNumber: string;
   startedAt: string;
+  /** `incoming` = lead called the telecaller; desktop should open the form. */
+  direction: 'incoming' | 'outgoing';
 }
 
 /** In-memory active call per agent + SSE subscribers for desktop sync. */
@@ -28,6 +30,7 @@ export function startCallSession(params: {
   leadId: string;
   leadName: string;
   phoneNumber: string;
+  direction?: 'incoming' | 'outgoing';
 }): ActiveCallSession {
   const session: ActiveCallSession = {
     id: randomUUID(),
@@ -36,9 +39,18 @@ export function startCallSession(params: {
     leadName: params.leadName,
     phoneNumber: params.phoneNumber,
     startedAt: new Date().toISOString(),
+    direction: params.direction === 'incoming' ? 'incoming' : 'outgoing',
   };
   activeByAgent.set(params.agentId, session);
-  broadcast(params.agentId, 'call_started', session);
+  broadcast(params.agentId, 'call_started', {
+    id: session.id,
+    agent_id: session.agentId,
+    lead_id: session.leadId,
+    lead_name: session.leadName,
+    phone_number: session.phoneNumber,
+    started_at: session.startedAt,
+    direction: session.direction,
+  });
   return session;
 }
 
@@ -68,7 +80,15 @@ export function subscribe(agentId: string, res: Response): void {
 
   const active = activeByAgent.get(agentId);
   if (active) {
-    writeEvent(res, 'call_started', active);
+    writeEvent(res, 'call_started', {
+      id: active.id,
+      agent_id: active.agentId,
+      lead_id: active.leadId,
+      lead_name: active.leadName,
+      phone_number: active.phoneNumber,
+      started_at: active.startedAt,
+      direction: active.direction,
+    });
   }
 }
 
