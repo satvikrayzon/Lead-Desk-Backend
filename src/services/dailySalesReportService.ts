@@ -278,16 +278,41 @@ function classifyDial(
   }
 }
 
+type ReportUser = {
+  _id: Types.ObjectId;
+  name: string;
+  email?: string | null;
+  teamName?: string | null;
+};
+
+const PRIOR_CALLED_MS = 90 * 24 * 60 * 60 * 1000;
+
 export async function buildDailySalesReport(
   agentId: string,
   rangeStart: Date,
-  rangeEndExclusive: Date
+  rangeEndExclusive: Date,
+  preloadedUser?: ReportUser
+): Promise<DailySalesReport> {
+  const cacheKey = `sales1|${agentId}|${rangeStart.toISOString()}|${rangeEndExclusive.toISOString()}`;
+  const data = await withAdminDashCache(cacheKey, () =>
+    computeDailySalesReport(agentId, rangeStart, rangeEndExclusive, preloadedUser)
+  );
+  return data as DailySalesReport;
+}
+
+async function computeDailySalesReport(
+  agentId: string,
+  rangeStart: Date,
+  rangeEndExclusive: Date,
+  preloadedUser?: ReportUser
 ): Promise<DailySalesReport> {
   if (!Types.ObjectId.isValid(agentId)) {
     throw new Error('Invalid agent id');
   }
 
-  const user = await User.findById(agentId).select('name email teamName');
+  const user =
+    preloadedUser ??
+    ((await User.findById(agentId).select('name email teamName').lean()) as ReportUser | null);
   if (!user) throw new Error('Telecaller not found');
 
   const fromKey = dateKey(rangeStart);
@@ -297,47 +322,44 @@ export async function buildDailySalesReport(
       ? dateDisplay(rangeStart)
       : `${dateDisplay(rangeStart)} → ${dateDisplay(new Date(rangeEndExclusive.getTime() - 1))}`;
 
-  const [assignments, remoteCalls, followUps, priorCalledLeadIds, talkRecordings] = await Promise.all([
-    LeadAssignment.find({ agentId, isActive: true }).select('leadId'),
-    RemoteCall.find({
-      agentId,
-      startTime: { $gte: rangeStart, $lt: rangeEndExclusive },
-      status: { $in: ['ended', 'busy', 'rejected', 'failed', 'no_answer'] },
-    }).select('leadId durationSeconds status callId startTime'),
-    LeadFollowUp.find({
-      agentId,
-      createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
-    })
-      .select(
-        'leadId remarks nextFollowupDate callOutcome leadResult clientCallId callRecordingId createdAt sequenceNumber'
-      )
-      .populate(
-        'leadId',
-        'companyName leadCode leadStage leadStatus status quotationValue probabilityPercent orderValue state district city'
-      ),
-    LeadFollowUp.distinct('leadId', {
-      agentId,
-      createdAt: { $lt: rangeStart },
-    }),
-    // Recordings exist only when the customer picked up — use for talk time only, never as dial attempts.
-    CallRecording.find({
-      agentId,
-      callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
-    }).select('durationSeconds clientCallId'),
-  ]);
+  const priorStart = new Date(rangeStart.getTime() - PRIOR_CALLED_MS);
 
-  const assignedLeadIds = assignments.map((a) => a.leadId);
-  const assignedLeads =
-    assignedLeadIds.length > 0
-      ? await Lead.find({ _id: { $in: assignedLeadIds } }).select('state district city')
-      : [];
+  const [assignedCount, remoteCalls, followUps, priorCalledLeadIds, talkRecordings, priorRemotes] =
+    await Promise.all([
+      LeadAssignment.countDocuments({ agentId, isActive: true }),
+      RemoteCall.find({
+        agentId,
+        startTime: { $gte: rangeStart, $lt: rangeEndExclusive },
+        status: { $in: ['ended', 'busy', 'rejected', 'failed', 'no_answer'] },
+      })
+        .select('leadId durationSeconds status callId startTime')
+        .lean(),
+      LeadFollowUp.find({
+        agentId,
+        createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
+      })
+        .select(
+          'leadId remarks nextFollowupDate callOutcome leadResult clientCallId callRecordingId createdAt sequenceNumber'
+        )
+        .lean(),
+      LeadFollowUp.distinct('leadId', {
+        agentId,
+        createdAt: { $gte: priorStart, $lt: rangeStart },
+      }),
+      CallRecording.find({
+        agentId,
+        callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
+      })
+        .select('durationSeconds clientCallId')
+        .lean(),
+      RemoteCall.distinct('leadId', {
+        agentId,
+        startTime: { $gte: priorStart, $lt: rangeStart },
+        status: { $in: ['ended', 'busy', 'rejected', 'failed', 'no_answer'] },
+      }),
+    ]);
 
   const priorCalled = new Set(priorCalledLeadIds.map((id) => id.toString()));
-  const priorRemotes = await RemoteCall.distinct('leadId', {
-    agentId,
-    startTime: { $lt: rangeStart },
-    status: { $in: ['ended', 'busy', 'rejected', 'failed', 'no_answer'] },
-  });
   for (const id of priorRemotes) priorCalled.add(id.toString());
 
   const talkByClientCallId = new Map<string, number>();
@@ -431,14 +453,37 @@ export async function buildDailySalesReport(
   for (const f of followUps) {
     const leadKey = refLeadId(f.leadId);
     if (leadKey) touchedLeadIds.add(leadKey);
+  }
 
-    const lead = f.leadId as unknown as {
-      companyName?: string;
-      leadCode?: string;
-      leadStage?: string;
-      leadStatus?: string;
-      status?: string;
-    } | null;
+  const valueLeadIds = [...touchedLeadIds].filter((id) => Types.ObjectId.isValid(id));
+  const touchedLeads =
+    valueLeadIds.length > 0
+      ? await Lead.find({ _id: { $in: valueLeadIds } }).select(
+          'companyName leadCode leadStage leadStatus status quotationValue probabilityPercent orderValue state district city'
+        )
+      : [];
+  const leadById = new Map(
+    touchedLeads.map((l) => [
+      l._id.toString(),
+      {
+        companyName: l.companyName,
+        leadCode: l.leadCode,
+        leadStage: l.leadStage,
+        leadStatus: l.leadStatus,
+        status: (l as { status?: string }).status,
+        quotationValue: l.quotationValue,
+        probabilityPercent: l.probabilityPercent,
+        orderValue: l.orderValue,
+        state: l.state,
+        district: l.district,
+        city: l.city,
+      },
+    ])
+  );
+
+  for (const f of followUps) {
+    const leadKey = refLeadId(f.leadId);
+    const lead = leadById.get(leadKey) ?? null;
 
     let results = normalizeLeadResults(f.leadResult);
     if (results.length === 0) {
@@ -486,13 +531,6 @@ export async function buildDailySalesReport(
     }
   }
 
-  const touchedLeads =
-    touchedLeadIds.size > 0
-      ? await Lead.find({ _id: { $in: [...touchedLeadIds] } }).select(
-          'quotationValue probabilityPercent orderValue state district city'
-        )
-      : [];
-
   let estimatedSales = 0;
   for (const lead of touchedLeads) {
     const id = lead._id.toString();
@@ -502,13 +540,8 @@ export async function buildDailySalesReport(
   }
 
   const stateRegion =
-    modeString(touchedLeads.map((l) => l.state)) ||
-    modeString(assignedLeads.map((l) => l.state)) ||
-    modeString(touchedLeads.map((l) => l.district)) ||
-    modeString(assignedLeads.map((l) => l.district));
-  const targetArea =
-    modeString(touchedLeads.map((l) => l.district || l.city)) ||
-    modeString(assignedLeads.map((l) => l.district || l.city));
+    modeString(touchedLeads.map((l) => l.state)) || modeString(touchedLeads.map((l) => l.district));
+  const targetArea = modeString(touchedLeads.map((l) => l.district || l.city));
 
   return {
     employee: {
@@ -532,7 +565,7 @@ export async function buildDailySalesReport(
       busy_switched_off: bucket.busy,
       wrong_number: bucket.wrongNumber,
       decision_maker_connected: bucket.decisionMaker,
-      total_leads_assigned: assignments.length,
+      total_leads_assigned: assignedCount,
     },
     lead_sales: {
       interested,
@@ -610,11 +643,14 @@ export async function buildAllDailySalesReports(
       role: { $in: ['agent', 'manager'] },
       isActive: true,
     })
-      .select('_id')
-      .sort({ name: 1 });
+      .select('_id name email teamName')
+      .sort({ name: 1 })
+      .lean();
 
     return Promise.all(
-      agents.map((agent) => buildDailySalesReport(agent._id.toString(), rangeStart, rangeEndExclusive))
+      agents.map((agent) =>
+        buildDailySalesReport(agent._id.toString(), rangeStart, rangeEndExclusive, agent as ReportUser)
+      )
     );
   });
   return data as DailySalesReport[];
