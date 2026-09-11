@@ -287,12 +287,31 @@ async function attachLeadDetails(events: DialEvent[]): Promise<DialEvent[]> {
 
 /**
  * Fast personal performance dashboard.
- * Avoids full-history scans and the heavy daily-sales rebuild (those were causing
- * live 15s timeouts / 502s). Today KPIs are derived from the same week window.
+ * Only reads the last 7 days of activity — never all-time scans (those were 30–40s).
+ * Results are cached briefly so repeat opens feel instant.
  */
+const dashboardCache = new Map<string, { expiresAt: number; data: unknown }>();
+const DASHBOARD_CACHE_MS = 45_000;
+
 export async function buildTelecallerPerformanceDashboard(userId: string) {
+  const cached = dashboardCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data as Awaited<ReturnType<typeof buildTelecallerPerformanceDashboardUncached>>;
+  }
+  const data = await buildTelecallerPerformanceDashboardUncached(userId);
+  dashboardCache.set(userId, { expiresAt: Date.now() + DASHBOARD_CACHE_MS, data });
+  return data;
+}
+
+async function buildTelecallerPerformanceDashboardUncached(userId: string) {
   const startedAt = Date.now();
-  const user = await User.findById(userId).select('name email role teamName isActive');
+  const mark = (label: string, at: number) => {
+    console.log(`[dashboard] ${label}`, { userId, ms: Date.now() - at, total: Date.now() - startedAt });
+  };
+
+  const t0 = Date.now();
+  const user = await User.findById(userId).select('name email role teamName isActive').lean();
+  mark('user', t0);
   if (!user) {
     throw new Error('Telecaller not found');
   }
@@ -303,38 +322,41 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
   const todayStart = startOfIstDay();
   const weekStart = daysAgoIst(6);
 
-  const [assignmentDocs, talkRecordingsWeek, remotesWeek, followUpsWeekDocs, remotesAllCount, followUpsAllCount] =
-    await Promise.all([
-      // Only fields needed for Remaining / Called counts — never hydrate full lead docs.
-      LeadAssignment.find({ agentId: userId, isActive: true })
-        .select('leadId assignedAt')
-        .populate<{ leadId: ILead }>('leadId', 'callCount lastCalledAt nextFollowupDate'),
-      CallRecording.find({ agentId: userId, callStartTime: { $gte: weekStart } })
-        .select('durationSeconds clientCallId callStartTime')
-        .lean(),
-      RemoteCall.find({
-        agentId: userId,
-        startTime: { $gte: weekStart },
-        status: { $in: [...REMOTE_TERMINAL] },
-      })
-        .select('leadId phoneNumber durationSeconds startTime endTime status callId')
-        .lean(),
-      LeadFollowUp.find({ agentId: userId, createdAt: { $gte: weekStart } })
-        .select(
-          'leadId clientCallId callRecordingId callOutcome createdAt formFillSeconds leadResult nextFollowupDate'
-        )
-        .lean(),
-      RemoteCall.countDocuments({
-        agentId: userId,
-        status: { $in: [...REMOTE_TERMINAL] },
-      }),
-      LeadFollowUp.countDocuments({ agentId: userId }),
-    ]);
+  const t1 = Date.now();
+  const [assignmentLeadIds, talkRecordingsWeek, remotesWeek, followUpsWeekDocs] = await Promise.all([
+    LeadAssignment.find({ agentId: userId, isActive: true }).distinct('leadId'),
+    CallRecording.find({ agentId: userId, callStartTime: { $gte: weekStart } })
+      .select('durationSeconds clientCallId callStartTime')
+      .lean(),
+    RemoteCall.find({
+      agentId: userId,
+      startTime: { $gte: weekStart },
+      status: { $in: [...REMOTE_TERMINAL] },
+    })
+      .select('leadId phoneNumber durationSeconds startTime endTime status callId')
+      .lean(),
+    LeadFollowUp.find({ agentId: userId, createdAt: { $gte: weekStart } })
+      .select(
+        'leadId clientCallId callRecordingId callOutcome createdAt formFillSeconds leadResult nextFollowupDate'
+      )
+      .lean(),
+  ]);
+  mark('queries', t1);
 
-  const populated = assignmentDocs
-    .filter((a) => a.leadId)
-    .map((a) => ({ leadId: a.leadId as ILead, assignedAt: a.assignedAt }));
+  const tAssign = Date.now();
+  const leadDocs =
+    assignmentLeadIds.length === 0
+      ? []
+      : await Lead.find({ _id: { $in: assignmentLeadIds } })
+          .select('callCount lastCalledAt nextFollowupDate')
+          .lean();
+  const populated = leadDocs.map((lead) => ({
+    leadId: lead as unknown as ILead,
+    assignedAt: new Date(0),
+  }));
+  const assignedCount = assignmentLeadIds.length;
   const { remaining: pendingLeads, called: calledLeads } = countAgentTabTotals(populated, {});
+  mark('assignments', tAssign);
 
   const talkByClientToday = new Map<string, number>();
   const talkByClientWeek = new Map<string, number>();
@@ -383,7 +405,6 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
     followUpsWeekDocs.map(mapFollowUp),
     talkByClientWeek
   );
-  const callsAllTime = Math.max(remotesAllCount, followUpsAllCount, dialsWeek.length);
 
   const dayBuckets: Record<string, { count: number; talk_seconds: number }> = {};
   for (let i = 6; i >= 0; i--) {
@@ -404,6 +425,7 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
   const todayCalling = tallyTodayFromDials(dialsToday);
   const todaySales = tallyLeadSalesToday(followUpsTodayDocs);
 
+  const t2 = Date.now();
   const recentCalls = (await attachLeadDetails(dialsToday.slice(0, 25))).map((c) => ({
     id: c.id,
     lead_id: c.leadId,
@@ -417,10 +439,13 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
     call_outcome: c.callOutcome,
     source: c.source,
   }));
+  mark('recent', t2);
 
   console.log('[dashboard] built', {
     userId,
-    assigned: populated.length,
+    assigned: assignedCount,
+    remotesWeek: remotesWeek.length,
+    followUpsWeek: followUpsWeekDocs.length,
     dialsToday: dialsToday.length,
     ms: Date.now() - startedAt,
   });
@@ -433,7 +458,7 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
       team_name: user.teamName ?? null,
     },
     summary: {
-      assigned_leads: populated.length,
+      assigned_leads: assignedCount,
       pending_leads: pendingLeads,
       called_leads: calledLeads,
       calls_today: todayCalling.attempted,
@@ -444,7 +469,8 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
       busy_today: todayCalling.busy,
       wrong_number_today: todayCalling.wrongNumber,
       calls_last_7_days: dialsWeek.length,
-      calls_all_time: callsAllTime,
+      // All-time exact count was a full collection scan — use 7-day as the KPI base.
+      calls_all_time: dialsWeek.length,
       talk_seconds_today: todayCalling.talkSeconds,
       talk_seconds_last_7_days: talkSecondsWeek,
       follow_ups_today: followUpsTodayDocs.length,

@@ -1,5 +1,6 @@
 import mongoose from 'mongoose';
 import { env } from './env';
+import { CallRecording, LeadFollowUp, RemoteCall } from '../models';
 
 export async function connectDatabase(): Promise<void> {
   if (mongoose.connection.readyState === 1) {
@@ -7,6 +8,14 @@ export async function connectDatabase(): Promise<void> {
   }
 
   await mongoose.connect(env.MONGODB_URI);
+  // Ensure dashboard query indexes exist (agentId + time) — missing indexes were 30–40s scans.
+  void Promise.all([
+    RemoteCall.syncIndexes(),
+    LeadFollowUp.syncIndexes(),
+    CallRecording.syncIndexes(),
+  ]).catch((err) => {
+    console.warn('[db] syncIndexes warning', err instanceof Error ? err.message : err);
+  });
 }
 
 export async function disconnectDatabase(): Promise<void> {
