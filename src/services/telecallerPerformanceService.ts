@@ -3,6 +3,7 @@ import { ILead } from '../models/Lead';
 import { buildDailySalesReport } from './dailySalesReportService';
 import { countAgentTabTotals } from '../modules/leads/leadListFilters';
 import { dateKeyIst, daysAgoIst, startOfIstDay } from '../utils/istCalendar';
+import { localRecordingExists } from './localRecordingStore';
 
 const REMOTE_TERMINAL = ['ended', 'busy', 'rejected', 'failed', 'no_answer'] as const;
 
@@ -522,7 +523,7 @@ export async function listAgentCallHistory(userId: string, limit = 150) {
       agentId: userId,
       callStartTime: { $gte: since },
     })
-      .select('clientCallId durationSeconds uploadStatus _id')
+      .select('clientCallId durationSeconds uploadStatus _id s3Key s3Bucket')
       .lean(),
   ]);
 
@@ -532,9 +533,10 @@ export async function listAgentCallHistory(userId: string, limit = 150) {
     if (!r.clientCallId) continue;
     const secs = Math.max(0, r.durationSeconds || 0);
     talkByClient.set(r.clientCallId, Math.max(talkByClient.get(r.clientCallId) ?? 0, secs));
+    const fileOnDisk = !r.s3Key || r.s3Bucket === 'local' ? localRecordingExists(r.s3Key || '') : true;
     recordingByClient.set(r.clientCallId, {
       id: r._id.toString(),
-      uploaded: r.uploadStatus === 'uploaded',
+      uploaded: r.uploadStatus === 'uploaded' && fileOnDisk,
     });
   }
 
@@ -577,8 +579,9 @@ export async function listAgentCallHistory(userId: string, limit = 150) {
       call_outcome: c.callOutcome,
       client_call_id: c.clientCallId ?? null,
       source: c.source,
-      recording_id: rec?.id ?? null,
+      recording_id: rec?.uploaded ? rec.id : null,
       recording_url: rec?.uploaded ? `recordings/${rec.id}/file` : null,
+      has_recording: Boolean(rec?.uploaded),
     };
   });
 }

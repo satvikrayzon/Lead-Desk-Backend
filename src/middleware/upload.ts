@@ -3,7 +3,7 @@ import { Request } from 'express';
 import multer from 'multer';
 import { ALLOWED_AUDIO_MIME_TYPES, MAX_UPLOAD_BYTES } from '../config/env';
 
-const ALLOWED_AUDIO_EXTENSIONS = new Set(['.m4a', '.mp4', '.aac', '.mp3', '.mpeg', '.3gp']);
+const ALLOWED_AUDIO_EXTENSIONS = new Set(['.m4a', '.mp4', '.aac', '.mp3', '.mpeg', '.3gp', '.amr']);
 
 const storage = multer.memoryStorage();
 

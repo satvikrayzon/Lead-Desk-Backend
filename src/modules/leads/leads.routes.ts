@@ -6,7 +6,7 @@ import { z } from 'zod';
 
 import { Lead, LeadAssignment, CallRecording, User } from '../../models';
 
-import { env } from '../../config/env';
+import { publicRecordingUrl } from '../../utils/recordingUrl';
 
 import { AuthRequest } from '../../middleware/auth';
 
@@ -705,17 +705,7 @@ leadsRouter.get('/:leadId/calls', async (req: AuthRequest, res: Response, next: 
 
       recordings.map(async (rec) => {
 
-        let recordingUrl: string | null = null;
-
-        if (rec.uploadStatus === 'uploaded') {
-          if (env.S3_ENABLED && rec.s3Bucket !== 'local') {
-            const { getPresignedUrl } = await import('../../config/s3');
-            const presigned = await getPresignedUrl(rec.s3Key);
-            recordingUrl = presigned.url;
-          } else {
-            recordingUrl = `recordings/${rec._id.toString()}/file`;
-          }
-        }
+        const recordingUrl = await publicRecordingUrl(rec);
 
 
 
@@ -748,6 +738,10 @@ leadsRouter.get('/:leadId/calls', async (req: AuthRequest, res: Response, next: 
           client_call_id: rec.clientCallId ?? null,
 
           recording_url: recordingUrl,
+
+          has_recording: Boolean(recordingUrl),
+
+          recording_id: recordingUrl ? rec._id.toString() : null,
 
           created_at: rec.createdAt.toISOString(),
 

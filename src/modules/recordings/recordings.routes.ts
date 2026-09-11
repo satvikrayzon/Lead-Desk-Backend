@@ -1,5 +1,5 @@
 import { Router, Response, NextFunction } from 'express';
-import { createReadStream, existsSync } from 'fs';
+import { createReadStream } from 'fs';
 import { CallRecording, Lead } from '../../models';
 import { linkFollowUpsToRecording } from '../../utils/linkFollowUpRecording';
 import { env } from '../../config/env';
@@ -13,7 +13,7 @@ import {
   createAuditLog,
   isDuplicateKeyError,
 } from '../../utils/helpers';
-import { saveLocalRecording, resolveLocalRecordingPath } from '../../services/localRecordingStore';
+import { saveLocalRecording, resolveExistingLocalRecordingPath, localRecordingExists } from '../../services/localRecordingStore';
 import { parseClientDateTime } from '../../utils/istCalendar';
 import { RecordingSource } from '../../types/enums';
 import { notifyRecordingReady } from '../../services/realtimeNotify';
@@ -56,14 +56,17 @@ recordingsRouter.post(
 
       const callStartTime = parseClientDateTime(String(call_start_time));
       const callEndTime = parseClientDateTime(String(call_end_time));
-      const durationSeconds = parseInt(duration_seconds, 10);
+      let durationSeconds = parseInt(String(duration_seconds), 10);
 
       if (isNaN(callStartTime.getTime()) || isNaN(callEndTime.getTime())) {
         throw new AppError(400, 'Invalid date format for call times.');
       }
 
-      if (durationSeconds < 1) {
-        throw new AppError(400, 'Recording upload requires a connected call (duration > 0).');
+      if (isNaN(durationSeconds) || durationSeconds < 1) {
+        durationSeconds = Math.max(
+          1,
+          Math.round((callEndTime.getTime() - callStartTime.getTime()) / 1000)
+        );
       }
 
       const lead = await Lead.findById(lead_id);
@@ -83,22 +86,8 @@ recordingsRouter.post(
         phoneNumber: phone_number,
       });
 
-      if (existing) {
-        if (client_call_id) {
-          await linkFollowUpsToRecording(client_call_id, existing._id);
-          if (!existing.clientCallId) {
-            existing.clientCallId = client_call_id;
-            await existing.save();
-          }
-        }
-        return res.json({
-          recording_id: existing._id.toString(),
-          id: existing._id.toString(),
-        });
-      }
-
       const ext = req.file.originalname?.split('.').pop() || 'm4a';
-      const s3Key = buildRecordingS3Key({
+      const s3Key = existing?.s3Key || buildRecordingS3Key({
         agentId: userId,
         leadId: lead_id,
         phoneNumber: phone_number,
@@ -123,6 +112,39 @@ recordingsRouter.post(
         }
       } catch {
         throw new AppError(500, 'Failed to store recording.');
+      }
+
+      if (existing) {
+        existing.s3Key = s3Key;
+        existing.s3Bucket = storageBucket;
+        existing.fileSizeBytes = req.file.size;
+        existing.mimeType = req.file.mimetype;
+        existing.originalFilename = req.file.originalname;
+        existing.uploadStatus = 'uploaded';
+        existing.durationSeconds = durationSeconds;
+        existing.callEndTime = callEndTime;
+        existing.source = source as RecordingSource;
+        if (client_call_id && !existing.clientCallId) {
+          existing.clientCallId = client_call_id;
+        }
+        await existing.save();
+        if (client_call_id) {
+          await linkFollowUpsToRecording(client_call_id, existing._id);
+        }
+        notifyRecordingReady({
+          recordingId: existing._id.toString(),
+          leadId: lead_id,
+          agentId: userId,
+          phoneNumber: phone_number,
+          clientCallId: client_call_id || existing.clientCallId || null,
+          callStartTime: callStartTime.toISOString(),
+          callEndTime: callEndTime.toISOString(),
+          durationSeconds,
+        });
+        return res.json({
+          recording_id: existing._id.toString(),
+          id: existing._id.toString(),
+        });
       }
 
       let recording;
@@ -260,8 +282,8 @@ recordingsRouter.get('/:recordingId/file', async (req: AuthRequest, res: Respons
       return res.redirect(302, url);
     }
 
-    const filePath = resolveLocalRecordingPath(recording.s3Key);
-    if (!existsSync(filePath)) {
+    const filePath = resolveExistingLocalRecordingPath(recording.s3Key);
+    if (!filePath) {
       throw new AppError(
         404,
         'Recording file missing on server. It may have been deleted or never saved to disk.'
@@ -297,6 +319,12 @@ recordingsRouter.get('/:recordingId', async (req: AuthRequest, res: Response, ne
     }
 
     if (!env.S3_ENABLED || recording.s3Bucket === 'local') {
+      if (!localRecordingExists(recording.s3Key)) {
+        throw new AppError(
+          404,
+          'Recording file missing on server. It may have been deleted or never saved to disk.'
+        );
+      }
       return res.json({
         url: `recordings/${recordingId}/file`,
         expires_at: null,

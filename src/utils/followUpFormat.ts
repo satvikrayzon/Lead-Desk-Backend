@@ -1,5 +1,4 @@
-import { env } from '../config/env';
-import { getPresignedUrl } from '../config/s3';
+import { publicRecordingUrl } from './recordingUrl';
 import { ICallRecording } from '../models/CallRecording';
 import { ILead } from '../models/Lead';
 import { ILeadFollowUp } from '../models/LeadFollowUp';
@@ -34,17 +33,7 @@ export interface FollowUpResponse {
 export async function formatRecordingPayload(
   recording: ICallRecording
 ): Promise<FollowUpCallPayload> {
-  let recordingUrl: string | null = null;
-  if (recording.uploadStatus === 'uploaded') {
-    if (env.S3_ENABLED && recording.s3Bucket !== 'local') {
-      const presigned = await getPresignedUrl(recording.s3Key);
-      recordingUrl = presigned.url;
-    } else {
-      // Relative to /api — clients prepend their configured apiBaseUrl so
-      // playback works even when server API_BASE_URL is an internal LAN IP.
-      recordingUrl = `recordings/${recording._id.toString()}/file`;
-    }
-  }
+  const recordingUrl = await publicRecordingUrl(recording);
 
   return {
     id: recording._id.toString(),
