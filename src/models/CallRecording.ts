@@ -43,6 +43,7 @@ const callRecordingSchema = new Schema<ICallRecording>(
 
 callRecordingSchema.index({ leadId: 1, callStartTime: -1 });
 callRecordingSchema.index({ agentId: 1, createdAt: -1 });
+callRecordingSchema.index({ agentId: 1, callStartTime: -1 });
 callRecordingSchema.index(
   { agentId: 1, leadId: 1, callStartTime: 1, phoneNumber: 1 },
   { unique: true }

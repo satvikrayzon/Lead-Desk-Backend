@@ -51,6 +51,7 @@ const remoteCallSchema = new Schema<IRemoteCall>(
 );
 
 remoteCallSchema.index({ agentId: 1, createdAt: -1 });
+remoteCallSchema.index({ agentId: 1, startTime: -1 });
 remoteCallSchema.index({ leadId: 1, createdAt: -1 });
 
 export const RemoteCall: Model<IRemoteCall> =

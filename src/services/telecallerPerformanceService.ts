@@ -1,6 +1,5 @@
 import { CallRecording, Lead, LeadAssignment, LeadFollowUp, RemoteCall, User } from '../models';
 import { ILead } from '../models/Lead';
-import { buildDailySalesReport } from './dailySalesReportService';
 import { countAgentTabTotals } from '../modules/leads/leadListFilters';
 import { dateKeyIst, daysAgoIst, startOfIstDay } from '../utils/istCalendar';
 import { localRecordingExists } from './localRecordingStore';
@@ -44,6 +43,126 @@ function refId(ref: unknown): string {
   return String(ref);
 }
 
+function normalizeOutcome(raw: string | undefined | null): string {
+  const v = (raw || 'unknown').trim();
+  if (v === 'not_pickup' || v === 'no_answer' || v === 'noAnswer') return 'notPickup';
+  if (v === 'not_connected') return 'notConnected';
+  if (v === 'wrong_number') return 'wrongNumber';
+  if (v === 'decision_maker' || v === 'decision_maker_connected') return 'decisionMakerConnected';
+  if (v === 'connected' || v === 'ended' || v === 'active') return 'received';
+  if (v === 'rejected' || v === 'failed') return 'notConnected';
+  return v || 'unknown';
+}
+
+function normalizeLeadResultToken(raw: string): string | null {
+  const v = raw.trim().toLowerCase();
+  if (!v) return null;
+  const map: Record<string, string> = {
+    interested: 'interested',
+    not_interested: 'not_interested',
+    'not interested': 'not_interested',
+    follow_up_required: 'follow_up_required',
+    'follow-up required': 'follow_up_required',
+    followup_required: 'follow_up_required',
+    qualified: 'qualified',
+    'qualified lead': 'qualified',
+    rate_provided: 'rate_provided',
+    'rate provided': 'rate_provided',
+    closed: 'closed',
+    'closed / order received': 'closed',
+    order_received: 'closed',
+  };
+  return map[v] ?? null;
+}
+
+function tallyTodayFromDials(dials: DialEvent[]) {
+  let connected = 0;
+  let noAnswer = 0;
+  let busy = 0;
+  let wrongNumber = 0;
+  let raw = 0;
+  let followUp = 0;
+  let talkSeconds = 0;
+  for (const d of dials) {
+    talkSeconds += Math.max(0, d.durationSeconds || 0);
+    if (d.source === 'follow_up') followUp += 1;
+    else raw += 1;
+    switch (normalizeOutcome(d.callOutcome)) {
+      case 'received':
+      case 'decisionMakerConnected':
+        connected += 1;
+        break;
+      case 'notPickup':
+        noAnswer += 1;
+        break;
+      case 'busy':
+      case 'notConnected':
+        busy += 1;
+        break;
+      case 'wrongNumber':
+        wrongNumber += 1;
+        break;
+      default:
+        break;
+    }
+  }
+  return { connected, noAnswer, busy, wrongNumber, raw, followUp, talkSeconds, attempted: dials.length };
+}
+
+function tallyLeadSalesToday(
+  followUps: Array<{ leadResult?: string | null; nextFollowupDate?: Date | null }>
+) {
+  let interested = 0;
+  let notInterested = 0;
+  let followUpRequired = 0;
+  let qualified = 0;
+  let rateProvided = 0;
+  let closed = 0;
+  let nextFollowUps = 0;
+  for (const f of followUps) {
+    if (f.nextFollowupDate) nextFollowUps += 1;
+    const raw = f.leadResult || '';
+    const parts = raw.split(/[,|;]/);
+    const seen = new Set<string>();
+    for (const part of parts) {
+      const n = normalizeLeadResultToken(part);
+      if (!n || seen.has(n)) continue;
+      seen.add(n);
+      switch (n) {
+        case 'interested':
+          interested += 1;
+          break;
+        case 'not_interested':
+          notInterested += 1;
+          break;
+        case 'follow_up_required':
+          followUpRequired += 1;
+          break;
+        case 'qualified':
+          qualified += 1;
+          break;
+        case 'rate_provided':
+          rateProvided += 1;
+          break;
+        case 'closed':
+          closed += 1;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return {
+    interested,
+    notInterested,
+    followUpRequired,
+    qualified,
+    rateProvided,
+    closed,
+    nextFollowUps,
+  };
+}
+
 /**
  * Merge remotes + follow-up dials.
  * CallRecording is never counted as a dial (only exists when customer picked up).
@@ -84,16 +203,15 @@ function mergeDials(
 
   const near = (leadKey: string, startMs: number, windowMs = 5 * 60 * 1000) => {
     const list = dialTimesByLead.get(leadKey);
-    if (!list?.length) return false;
+    if (!list || list.length === 0) return false;
     return list.some((t) => Math.abs(t - startMs) <= windowMs);
   };
 
   for (const f of followUps) {
-    const clientId = f.clientCallId?.trim() || '';
     const leadKey = refId(f.leadId);
     const startMs = f.createdAt ? new Date(f.createdAt).getTime() : Date.now();
-    const talk = clientId ? talkByClientCallId.get(clientId) ?? 0 : 0;
-
+    const clientId = f.clientCallId?.trim() || '';
+    const talk = (clientId ? talkByClientCallId.get(clientId) : undefined) ?? 0;
     events.push({
       id: f._id.toString(),
       leadId: leadKey,
@@ -167,8 +285,13 @@ async function attachLeadDetails(events: DialEvent[]): Promise<DialEvent[]> {
   });
 }
 
-/** Same performance payload for telecaller "My Performance" and admin drill-down. */
+/**
+ * Fast personal performance dashboard.
+ * Avoids full-history scans and the heavy daily-sales rebuild (those were causing
+ * live 15s timeouts / 502s). Today KPIs are derived from the same week window.
+ */
 export async function buildTelecallerPerformanceDashboard(userId: string) {
+  const startedAt = Date.now();
   const user = await User.findById(userId).select('name email role teamName isActive');
   if (!user) {
     throw new Error('Telecaller not found');
@@ -180,45 +303,33 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
   const todayStart = startOfIstDay();
   const weekStart = daysAgoIst(6);
 
-  const [
-    assignmentDocs,
-    talkRecordingsWeek,
-    remotesToday,
-    remotesWeek,
-    followUpsTodayDocs,
-    followUpsWeekDocs,
-    remotesAllCount,
-    followUpsAllCount,
-  ] = await Promise.all([
-    LeadAssignment.find({ agentId: userId, isActive: true })
-      .sort({ assignedAt: -1 })
-      .populate<{ leadId: ILead }>('leadId'),
-    CallRecording.find({ agentId: userId, callStartTime: { $gte: weekStart } }).select(
-      'durationSeconds clientCallId callStartTime'
-    ),
-    RemoteCall.find({
-      agentId: userId,
-      startTime: { $gte: todayStart },
-      status: { $in: [...REMOTE_TERMINAL] },
-    }).select('leadId phoneNumber durationSeconds startTime endTime status callId'),
-    RemoteCall.find({
-      agentId: userId,
-      startTime: { $gte: weekStart },
-      status: { $in: [...REMOTE_TERMINAL] },
-    }).select('leadId phoneNumber durationSeconds startTime endTime status callId'),
-    LeadFollowUp.find({ agentId: userId, createdAt: { $gte: todayStart } }).select(
-      'leadId clientCallId callRecordingId callOutcome createdAt formFillSeconds'
-    ),
-    LeadFollowUp.find({ agentId: userId, createdAt: { $gte: weekStart } }).select(
-      'leadId clientCallId callRecordingId callOutcome createdAt formFillSeconds'
-    ),
-    // All-time: counts only — never load full history (was timing out / 502 on live).
-    RemoteCall.countDocuments({
-      agentId: userId,
-      status: { $in: [...REMOTE_TERMINAL] },
-    }),
-    LeadFollowUp.countDocuments({ agentId: userId }),
-  ]);
+  const [assignmentDocs, talkRecordingsWeek, remotesWeek, followUpsWeekDocs, remotesAllCount, followUpsAllCount] =
+    await Promise.all([
+      // Only fields needed for Remaining / Called counts — never hydrate full lead docs.
+      LeadAssignment.find({ agentId: userId, isActive: true })
+        .select('leadId assignedAt')
+        .populate<{ leadId: ILead }>('leadId', 'callCount lastCalledAt nextFollowupDate'),
+      CallRecording.find({ agentId: userId, callStartTime: { $gte: weekStart } })
+        .select('durationSeconds clientCallId callStartTime')
+        .lean(),
+      RemoteCall.find({
+        agentId: userId,
+        startTime: { $gte: weekStart },
+        status: { $in: [...REMOTE_TERMINAL] },
+      })
+        .select('leadId phoneNumber durationSeconds startTime endTime status callId')
+        .lean(),
+      LeadFollowUp.find({ agentId: userId, createdAt: { $gte: weekStart } })
+        .select(
+          'leadId clientCallId callRecordingId callOutcome createdAt formFillSeconds leadResult nextFollowupDate'
+        )
+        .lean(),
+      RemoteCall.countDocuments({
+        agentId: userId,
+        status: { $in: [...REMOTE_TERMINAL] },
+      }),
+      LeadFollowUp.countDocuments({ agentId: userId }),
+    ]);
 
   const populated = assignmentDocs
     .filter((a) => a.leadId)
@@ -239,14 +350,10 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
     }
   }
 
-  const mapFollowUp = (f: {
-    _id: { toString(): string };
-    leadId: unknown;
-    clientCallId?: string;
-    callRecordingId?: { toString(): string } | null;
-    callOutcome?: string;
-    createdAt: Date;
-  }) => ({
+  const remotesToday = remotesWeek.filter((c) => c.startTime >= todayStart);
+  const followUpsTodayDocs = followUpsWeekDocs.filter((f) => f.createdAt >= todayStart);
+
+  const mapFollowUp = (f: (typeof followUpsWeekDocs)[number]) => ({
     _id: f._id,
     leadId: f.leadId,
     clientCallId: f.clientCallId,
@@ -255,7 +362,7 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
     createdAt: f.createdAt,
   });
 
-  const mapRemote = (c: (typeof remotesToday)[number]) => ({
+  const mapRemote = (c: (typeof remotesWeek)[number]) => ({
     _id: c._id,
     callId: c.callId,
     leadId: c.leadId,
@@ -276,11 +383,7 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
     followUpsWeekDocs.map(mapFollowUp),
     talkByClientWeek
   );
-  // Prefer remote dial count; fall back to follow-ups if remotes are empty.
   const callsAllTime = Math.max(remotesAllCount, followUpsAllCount, dialsWeek.length);
-
-  let talkSecondsToday = 0;
-  for (const c of dialsToday) talkSecondsToday += c.durationSeconds;
 
   const dayBuckets: Record<string, { count: number; talk_seconds: number }> = {};
   for (let i = 6; i >= 0; i--) {
@@ -298,8 +401,8 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
 
   const fillToday = avgFormFill(followUpsTodayDocs);
   const fillWeek = avgFormFill(followUpsWeekDocs);
-  const followUpsToday = followUpsTodayDocs.length;
-  const followUpsWeek = followUpsWeekDocs.length;
+  const todayCalling = tallyTodayFromDials(dialsToday);
+  const todaySales = tallyLeadSalesToday(followUpsTodayDocs);
 
   const recentCalls = (await attachLeadDetails(dialsToday.slice(0, 25))).map((c) => ({
     id: c.id,
@@ -315,8 +418,12 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
     source: c.source,
   }));
 
-  const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
-  const todayReport = await buildDailySalesReport(userId, todayStart, tomorrowStart);
+  console.log('[dashboard] built', {
+    userId,
+    assigned: populated.length,
+    dialsToday: dialsToday.length,
+    ms: Date.now() - startedAt,
+  });
 
   return {
     telecaller: {
@@ -329,26 +436,26 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
       assigned_leads: populated.length,
       pending_leads: pendingLeads,
       called_leads: calledLeads,
-      calls_today: todayReport.calling.calls_attempted,
-      calls_from_raw_leads_today: todayReport.calling.calls_from_raw_leads,
-      calls_from_follow_ups_today: todayReport.calling.calls_from_follow_ups,
-      calls_connected_today: todayReport.calling.calls_connected,
-      no_answer_today: todayReport.calling.no_answer,
-      busy_today: todayReport.calling.busy_switched_off,
-      wrong_number_today: todayReport.calling.wrong_number,
+      calls_today: todayCalling.attempted,
+      calls_from_raw_leads_today: todayCalling.raw,
+      calls_from_follow_ups_today: todayCalling.followUp,
+      calls_connected_today: todayCalling.connected,
+      no_answer_today: todayCalling.noAnswer,
+      busy_today: todayCalling.busy,
+      wrong_number_today: todayCalling.wrongNumber,
       calls_last_7_days: dialsWeek.length,
       calls_all_time: callsAllTime,
-      talk_seconds_today: Math.max(talkSecondsToday, todayReport.talk_seconds),
+      talk_seconds_today: todayCalling.talkSeconds,
       talk_seconds_last_7_days: talkSecondsWeek,
-      follow_ups_today: followUpsToday,
-      follow_ups_last_7_days: followUpsWeek,
-      next_follow_ups_today: todayReport.next_follow_up.total_follow_up_calls,
-      interested_today: todayReport.lead_sales.interested,
-      not_interested_today: todayReport.lead_sales.not_interested,
-      follow_up_required_today: todayReport.lead_sales.follow_up_required,
-      qualified_today: todayReport.lead_sales.qualified_leads,
-      rate_provided_today: todayReport.lead_sales.rate_provided,
-      closed_today: todayReport.lead_sales.closed_order_received,
+      follow_ups_today: followUpsTodayDocs.length,
+      follow_ups_last_7_days: followUpsWeekDocs.length,
+      next_follow_ups_today: todaySales.nextFollowUps,
+      interested_today: todaySales.interested,
+      not_interested_today: todaySales.notInterested,
+      follow_up_required_today: todaySales.followUpRequired,
+      qualified_today: todaySales.qualified,
+      rate_provided_today: todaySales.rateProvided,
+      closed_today: todaySales.closed,
       avg_form_fill_seconds_today: fillToday.avg,
       avg_form_fill_seconds_last_7_days: fillWeek.avg,
       form_fills_today: fillToday.count,

@@ -34,6 +34,7 @@ const leadFollowUpSchema = new Schema<ILeadFollowUp>(
 );
 
 leadFollowUpSchema.index({ leadId: 1, createdAt: -1 });
+leadFollowUpSchema.index({ agentId: 1, createdAt: -1 });
 leadFollowUpSchema.index({ agentId: 1, nextFollowupDate: 1 });
 leadFollowUpSchema.index({ clientCallId: 1 }, { unique: true });
 leadFollowUpSchema.index({ callRecordingId: 1 }, { sparse: true, unique: true });
