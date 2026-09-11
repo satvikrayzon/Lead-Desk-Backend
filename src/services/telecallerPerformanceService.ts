@@ -179,17 +179,16 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
 
   const todayStart = startOfIstDay();
   const weekStart = daysAgoIst(6);
-  const allTimeStart = new Date(0);
 
   const [
     assignmentDocs,
     talkRecordingsWeek,
     remotesToday,
     remotesWeek,
-    remotesAll,
     followUpsTodayDocs,
     followUpsWeekDocs,
-    followUpsAllDocs,
+    remotesAllCount,
+    followUpsAllCount,
   ] = await Promise.all([
     LeadAssignment.find({ agentId: userId, isActive: true })
       .sort({ assignedAt: -1 })
@@ -207,20 +206,18 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
       startTime: { $gte: weekStart },
       status: { $in: [...REMOTE_TERMINAL] },
     }).select('leadId phoneNumber durationSeconds startTime endTime status callId'),
-    RemoteCall.find({
-      agentId: userId,
-      startTime: { $gte: allTimeStart },
-      status: { $in: [...REMOTE_TERMINAL] },
-    }).select('_id leadId startTime callId'),
     LeadFollowUp.find({ agentId: userId, createdAt: { $gte: todayStart } }).select(
       'leadId clientCallId callRecordingId callOutcome createdAt formFillSeconds'
     ),
     LeadFollowUp.find({ agentId: userId, createdAt: { $gte: weekStart } }).select(
       'leadId clientCallId callRecordingId callOutcome createdAt formFillSeconds'
     ),
-    LeadFollowUp.find({ agentId: userId, createdAt: { $gte: allTimeStart } }).select(
-      '_id leadId clientCallId callRecordingId callOutcome createdAt'
-    ),
+    // All-time: counts only — never load full history (was timing out / 502 on live).
+    RemoteCall.countDocuments({
+      agentId: userId,
+      status: { $in: [...REMOTE_TERMINAL] },
+    }),
+    LeadFollowUp.countDocuments({ agentId: userId }),
   ]);
 
   const populated = assignmentDocs
@@ -279,18 +276,8 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
     followUpsWeekDocs.map(mapFollowUp),
     talkByClientWeek
   );
-  const dialsAll = mergeDials(
-    remotesAll.map((c) => ({
-      _id: c._id,
-      callId: c.callId,
-      leadId: c.leadId,
-      phoneNumber: '',
-      startTime: c.startTime,
-      durationSeconds: 0,
-      status: 'ended',
-    })),
-    followUpsAllDocs.map(mapFollowUp)
-  );
+  // Prefer remote dial count; fall back to follow-ups if remotes are empty.
+  const callsAllTime = Math.max(remotesAllCount, followUpsAllCount, dialsWeek.length);
 
   let talkSecondsToday = 0;
   for (const c of dialsToday) talkSecondsToday += c.durationSeconds;
@@ -350,7 +337,7 @@ export async function buildTelecallerPerformanceDashboard(userId: string) {
       busy_today: todayReport.calling.busy_switched_off,
       wrong_number_today: todayReport.calling.wrong_number,
       calls_last_7_days: dialsWeek.length,
-      calls_all_time: dialsAll.length,
+      calls_all_time: callsAllTime,
       talk_seconds_today: Math.max(talkSecondsToday, todayReport.talk_seconds),
       talk_seconds_last_7_days: talkSecondsWeek,
       follow_ups_today: followUpsToday,

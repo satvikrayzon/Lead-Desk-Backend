@@ -192,6 +192,22 @@ function normalizeLeadResult(raw: string | undefined | null): string | null {
   return map[v] ?? null;
 }
 
+/** Supports single values or comma/pipe-separated multi-select from the app. */
+function normalizeLeadResults(raw: string | undefined | null): string[] {
+  if (!raw) return [];
+  const parts = raw.split(/[,|;]/);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const part of parts) {
+    const n = normalizeLeadResult(part);
+    if (n && !seen.has(n)) {
+      seen.add(n);
+      out.push(n);
+    }
+  }
+  return out;
+}
+
 function refLeadId(ref: unknown): string {
   if (ref == null) return '';
   if (typeof ref === 'object' && ref !== null && '_id' in (ref as object)) {
@@ -409,7 +425,7 @@ export async function buildDailySalesReport(
   let nextFollowUps = 0;
   const keyRemarks: DailySalesReport['key_remarks'] = [];
   const valuedLeadIds = new Set<string>();
-  const latestResultByLead = new Map<string, string>();
+  const latestResultsByLead = new Map<string, string[]>();
 
   for (const f of followUps) {
     const leadKey = refLeadId(f.leadId);
@@ -423,11 +439,12 @@ export async function buildDailySalesReport(
       status?: string;
     } | null;
 
-    let result = normalizeLeadResult(f.leadResult);
-    if (!result) {
-      result = inferLeadResultFromLead(lead, f.nextFollowupDate != null);
+    let results = normalizeLeadResults(f.leadResult);
+    if (results.length === 0) {
+      const inferred = inferLeadResultFromLead(lead, f.nextFollowupDate != null);
+      if (inferred) results = [inferred];
     }
-    if (result && leadKey) latestResultByLead.set(leadKey, result);
+    if (results.length > 0 && leadKey) latestResultsByLead.set(leadKey, results);
 
     if (f.nextFollowupDate) nextFollowUps += 1;
 
@@ -441,28 +458,30 @@ export async function buildDailySalesReport(
     }
   }
 
-  for (const result of latestResultByLead.values()) {
-    switch (result) {
-      case 'interested':
-        interested += 1;
-        break;
-      case 'not_interested':
-        notInterested += 1;
-        break;
-      case 'follow_up_required':
-        followUpRequired += 1;
-        break;
-      case 'qualified':
-        qualified += 1;
-        break;
-      case 'rate_provided':
-        rateProvided += 1;
-        break;
-      case 'closed':
-        closed += 1;
-        break;
-      default:
-        break;
+  for (const results of latestResultsByLead.values()) {
+    for (const result of results) {
+      switch (result) {
+        case 'interested':
+          interested += 1;
+          break;
+        case 'not_interested':
+          notInterested += 1;
+          break;
+        case 'follow_up_required':
+          followUpRequired += 1;
+          break;
+        case 'qualified':
+          qualified += 1;
+          break;
+        case 'rate_provided':
+          rateProvided += 1;
+          break;
+        case 'closed':
+          closed += 1;
+          break;
+        default:
+          break;
+      }
     }
   }
 
