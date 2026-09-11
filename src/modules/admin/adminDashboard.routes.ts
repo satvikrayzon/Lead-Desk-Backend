@@ -105,9 +105,11 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       formFillsRange,
       followUpsRange,
     ] = await Promise.all([
+      // Only fields needed for Remaining/Called — full lead hydrate was timing out admin dashboard.
       LeadAssignment.find({ isActive: true, agentId: { $in: activeAgentIds } })
-        .populate<{ leadId: ILead }>('leadId')
-        .select('leadId agentId'),
+        .select('leadId agentId')
+        .populate<{ leadId: ILead }>('leadId', 'callCount lastCalledAt nextFollowupDate')
+        .lean(),
       loadCompanyDials(todayStart, tomorrowStart),
       loadCompanyDials(rangeStart, rangeEndExclusive),
       LeadFollowUp.find({
@@ -118,34 +120,43 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         .sort({ nextFollowupDate: 1 })
         .limit(40)
         .populate('leadId', 'companyName contactPerson contactMobile leadCode leadStage')
-        .populate('agentId', 'name email teamName'),
+        .populate('agentId', 'name email teamName')
+        .lean(),
       LeadFollowUp.find({
         agentId: { $in: activeAgentIds },
         nextFollowupDate: { $gte: todayStart, $lt: tomorrowStart },
-      }).select('leadId'),
+      })
+        .select('leadId')
+        .lean(),
       LeadFollowUp.find({
         agentId: { $in: activeAgentIds },
         createdAt: { $gte: todayStart, $lt: tomorrowStart },
         formFillSeconds: { $ne: null, $gte: 0 },
-      }).select('agentId formFillSeconds'),
+      })
+        .select('agentId formFillSeconds')
+        .lean(),
       LeadFollowUp.find({
         agentId: { $in: activeAgentIds },
         createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
         formFillSeconds: { $ne: null, $gte: 0 },
-      }).select('agentId formFillSeconds'),
+      })
+        .select('agentId formFillSeconds')
+        .lean(),
       LeadFollowUp.find({
         agentId: { $in: activeAgentIds },
         createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
-      }).select('agentId'),
+      })
+        .select('agentId')
+        .lean(),
     ]);
 
     const overdueLeadIds = new Set(overdueFollowUps.map((f) => refId(f.leadId)).filter(Boolean));
-    const dueTodayLeadIds = new Set(dueTodayFollowUps.map((f) => f.leadId.toString()));
+    const dueTodayLeadIds = new Set(dueTodayFollowUps.map((f) => refId(f.leadId)).filter(Boolean));
     const pendingLeadIds = new Set<string>();
     for (const a of assignments) {
       const lead = a.leadId as ILead | null;
       if (!lead) continue;
-      const id = lead._id.toString();
+      const id = String(lead._id);
       // Same Remaining rule as My Leads (incl. due today / overdue follow-ups).
       if (isRemainingAssignment(lead) || overdueLeadIds.has(id) || dueTodayLeadIds.has(id)) {
         pendingLeadIds.add(id);
@@ -156,8 +167,8 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     const pendingByAgent = new Map<string, number>();
     for (const a of assignments) {
       if (!a.leadId) continue;
-      const aid = a.agentId.toString();
-      const lid = (a.leadId as ILead)._id.toString();
+      const aid = String(a.agentId);
+      const lid = String((a.leadId as ILead)._id);
       assignedByAgent.set(aid, (assignedByAgent.get(aid) ?? 0) + 1);
       if (pendingLeadIds.has(lid)) {
         pendingByAgent.set(aid, (pendingByAgent.get(aid) ?? 0) + 1);
