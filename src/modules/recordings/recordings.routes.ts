@@ -79,12 +79,16 @@ recordingsRouter.post(
         throw new AppError(403, 'You do not have access to this lead.');
       }
 
-      const existing = await CallRecording.findOne({
-        agentId: userId,
-        leadId: lead_id,
-        callStartTime,
-        phoneNumber: phone_number,
-      });
+      const existing =
+        (client_call_id
+          ? await CallRecording.findOne({ agentId: userId, clientCallId: client_call_id })
+          : null) ||
+        (await CallRecording.findOne({
+          agentId: userId,
+          leadId: lead_id,
+          callStartTime,
+          phoneNumber: phone_number,
+        }));
 
       const ext = req.file.originalname?.split('.').pop() || 'm4a';
       const s3Key = existing?.s3Key || buildRecordingS3Key({
@@ -183,12 +187,29 @@ recordingsRouter.post(
             phoneNumber: phone_number,
           });
           if (dup) {
+            // File was already written above — point the existing row at it.
+            // Previously we returned the old id without updating s3Key, so the
+            // client showed "Uploaded" while GET /file 404'd.
+            dup.s3Key = s3Key;
+            dup.s3Bucket = storageBucket;
+            dup.fileSizeBytes = req.file.size;
+            dup.mimeType = req.file.mimetype;
+            dup.originalFilename = req.file.originalname;
+            dup.uploadStatus = 'uploaded';
+            dup.durationSeconds = durationSeconds;
+            dup.callEndTime = callEndTime;
+            dup.source = source as RecordingSource;
+            if (client_call_id) dup.clientCallId = client_call_id;
+            await dup.save();
+            if (client_call_id) {
+              await linkFollowUpsToRecording(client_call_id, dup._id);
+            }
             notifyRecordingReady({
               recordingId: dup._id.toString(),
               leadId: lead_id,
               agentId: userId,
               phoneNumber: phone_number,
-              clientCallId: client_call_id || null,
+              clientCallId: client_call_id || dup.clientCallId || null,
               callStartTime: callStartTime.toISOString(),
               callEndTime: (dup.callEndTime || callEndTime).toISOString(),
               durationSeconds: dup.durationSeconds ?? durationSeconds,
