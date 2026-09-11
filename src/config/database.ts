@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { env } from './env';
-import { CallRecording, LeadFollowUp, RemoteCall } from '../models';
+import { CallRecording, Lead, LeadAssignment, LeadFollowUp, RemoteCall } from '../models';
 
 export async function connectDatabase(): Promise<void> {
   if (mongoose.connection.readyState === 1) {
@@ -13,6 +13,8 @@ export async function connectDatabase(): Promise<void> {
     RemoteCall.syncIndexes(),
     LeadFollowUp.syncIndexes(),
     CallRecording.syncIndexes(),
+    LeadAssignment.syncIndexes(),
+    Lead.syncIndexes(),
   ]).catch((err) => {
     console.warn('[db] syncIndexes warning', err instanceof Error ? err.message : err);
   });

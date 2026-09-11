@@ -1,7 +1,11 @@
-import { CallRecording, Lead, LeadAssignment, LeadFollowUp, RemoteCall, User } from '../models';
-import { ILead } from '../models/Lead';
-import { countAgentTabTotals } from '../modules/leads/leadListFilters';
+import { Types } from 'mongoose';
+import { CallRecording, Lead, LeadFollowUp, RemoteCall, User } from '../models';
 import { dateKeyIst, daysAgoIst, startOfIstDay } from '../utils/istCalendar';
+import { loadAssignmentStatsByAgent } from './assignmentLeadLite';
+import {
+  invalidateDashboards,
+  withTelecallerDashCache,
+} from './dashboardCache';
 import { localRecordingExists } from './localRecordingStore';
 
 const REMOTE_TERMINAL = ['ended', 'busy', 'rejected', 'failed', 'no_answer'] as const;
@@ -290,28 +294,15 @@ async function attachLeadDetails(events: DialEvent[]): Promise<DialEvent[]> {
  * Only reads the last 7 days of activity — never all-time scans (those were 30–40s).
  * Results are cached briefly so repeat opens feel instant.
  */
-const dashboardCache = new Map<string, { expiresAt: number; data: unknown }>();
-const DASHBOARD_CACHE_MS = 45_000;
-
 export async function buildTelecallerPerformanceDashboard(userId: string) {
-  const cached = dashboardCache.get(userId);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.data as Awaited<ReturnType<typeof buildTelecallerPerformanceDashboardUncached>>;
-  }
-  const data = await buildTelecallerPerformanceDashboardUncached(userId);
-  dashboardCache.set(userId, { expiresAt: Date.now() + DASHBOARD_CACHE_MS, data });
-  return data;
+  const data = await withTelecallerDashCache(userId, () => buildTelecallerPerformanceDashboardUncached(userId));
+  return data as Awaited<ReturnType<typeof buildTelecallerPerformanceDashboardUncached>>;
 }
 
-async function buildTelecallerPerformanceDashboardUncached(userId: string) {
-  const startedAt = Date.now();
-  const mark = (label: string, at: number) => {
-    console.log(`[dashboard] ${label}`, { userId, ms: Date.now() - at, total: Date.now() - startedAt });
-  };
+export { invalidateDashboards };
 
-  const t0 = Date.now();
+async function buildTelecallerPerformanceDashboardUncached(userId: string) {
   const user = await User.findById(userId).select('name email role teamName isActive').lean();
-  mark('user', t0);
   if (!user) {
     throw new Error('Telecaller not found');
   }
@@ -322,9 +313,10 @@ async function buildTelecallerPerformanceDashboardUncached(userId: string) {
   const todayStart = startOfIstDay();
   const weekStart = daysAgoIst(6);
 
-  const t1 = Date.now();
-  const [assignmentLeadIds, talkRecordingsWeek, remotesWeek, followUpsWeekDocs] = await Promise.all([
-    LeadAssignment.find({ agentId: userId, isActive: true }).distinct('leadId'),
+  const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+  const agentOid = new Types.ObjectId(userId);
+  const [statsByAgent, talkRecordingsWeek, remotesWeek, followUpsWeekDocs] = await Promise.all([
+    loadAssignmentStatsByAgent([agentOid], tomorrowStart),
     CallRecording.find({ agentId: userId, callStartTime: { $gte: weekStart } })
       .select('durationSeconds clientCallId callStartTime')
       .lean(),
@@ -341,22 +333,11 @@ async function buildTelecallerPerformanceDashboardUncached(userId: string) {
       )
       .lean(),
   ]);
-  mark('queries', t1);
 
-  const tAssign = Date.now();
-  const leadDocs =
-    assignmentLeadIds.length === 0
-      ? []
-      : await Lead.find({ _id: { $in: assignmentLeadIds } })
-          .select('callCount lastCalledAt nextFollowupDate')
-          .lean();
-  const populated = leadDocs.map((lead) => ({
-    leadId: lead as unknown as ILead,
-    assignedAt: new Date(0),
-  }));
-  const assignedCount = assignmentLeadIds.length;
-  const { remaining: pendingLeads, called: calledLeads } = countAgentTabTotals(populated, {});
-  mark('assignments', tAssign);
+  const assignmentStats = statsByAgent.get(userId) ?? { assigned: 0, called: 0, remaining: 0 };
+  const assignedCount = assignmentStats.assigned;
+  const pendingLeads = assignmentStats.remaining;
+  const calledLeads = assignmentStats.called;
 
   const talkByClientToday = new Map<string, number>();
   const talkByClientWeek = new Map<string, number>();
@@ -425,7 +406,6 @@ async function buildTelecallerPerformanceDashboardUncached(userId: string) {
   const todayCalling = tallyTodayFromDials(dialsToday);
   const todaySales = tallyLeadSalesToday(followUpsTodayDocs);
 
-  const t2 = Date.now();
   const recentCalls = (await attachLeadDetails(dialsToday.slice(0, 25))).map((c) => ({
     id: c.id,
     lead_id: c.leadId,
@@ -439,16 +419,6 @@ async function buildTelecallerPerformanceDashboardUncached(userId: string) {
     call_outcome: c.callOutcome,
     source: c.source,
   }));
-  mark('recent', t2);
-
-  console.log('[dashboard] built', {
-    userId,
-    assigned: assignedCount,
-    remotesWeek: remotesWeek.length,
-    followUpsWeek: followUpsWeekDocs.length,
-    dialsToday: dialsToday.length,
-    ms: Date.now() - startedAt,
-  });
 
   return {
     telecaller: {
@@ -528,29 +498,41 @@ function outcomeFromRemoteStatus(status: string): string {
  */
 export async function loadCompanyDials(
   rangeStart: Date,
-  rangeEndExclusive: Date
+  rangeEndExclusive: Date,
+  activeIds?: Array<{ toString(): string }>
 ): Promise<CompanyDialRow[]> {
-  const activeAgents = await User.find({
-    role: { $in: ['agent', 'manager'] },
-    isActive: true,
-  }).select('_id');
-  const activeIds = activeAgents.map((u) => u._id);
-  if (activeIds.length === 0) return [];
+  let ids = activeIds;
+  if (!ids) {
+    const activeAgents = await User.find({
+      role: { $in: ['agent', 'manager'] },
+      isActive: true,
+    })
+      .select('_id')
+      .lean();
+    ids = activeAgents.map((u) => u._id);
+  }
+  if (!ids || ids.length === 0) return [];
 
   const [followUps, remotes, talkRecordings] = await Promise.all([
     LeadFollowUp.find({
-      agentId: { $in: activeIds },
+      agentId: { $in: ids },
       createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
-    }).select('agentId leadId clientCallId callOutcome createdAt'),
+    })
+      .select('agentId leadId clientCallId callOutcome createdAt')
+      .lean(),
     RemoteCall.find({
-      agentId: { $in: activeIds },
+      agentId: { $in: ids },
       startTime: { $gte: rangeStart, $lt: rangeEndExclusive },
       status: { $in: [...REMOTE_TERMINAL] },
-    }).select('agentId callId leadId startTime durationSeconds status'),
+    })
+      .select('agentId callId leadId startTime durationSeconds status')
+      .lean(),
     CallRecording.find({
-      agentId: { $in: activeIds },
+      agentId: { $in: ids },
       callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
-    }).select('clientCallId durationSeconds'),
+    })
+      .select('clientCallId durationSeconds')
+      .lean(),
   ]);
 
   const talkByClient = new Map<string, number>();

@@ -8,6 +8,7 @@ import { isSundayIst } from '../../utils/istCalendar';
 import { formatFollowUp } from '../../utils/followUpFormat';
 import { ILeadFollowUp } from '../../models/LeadFollowUp';
 import { ILead } from '../../models/Lead';
+import { invalidateDashboards } from '../../services/dashboardCache';
 
 export const followUpsRouter = Router();
 
@@ -40,18 +41,26 @@ followUpsRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunct
       filter.nextFollowupDate = { $ne: null };
     }
 
-    const followUps = await LeadFollowUp.find(filter)
-      .sort({ nextFollowupDate: 1, createdAt: -1 })
-      .limit(5000);
+    const followUpsQuery = LeadFollowUp.find(filter).sort({ nextFollowupDate: 1, createdAt: -1 }).limit(
+      scheduledOnly ? 500 : 200
+    );
+    if (scheduledOnly) {
+      followUpsQuery.select(
+        'leadId agentId clientCallId callRecordingId callOutcome leadResult remarks nextFollowupDate formFillSeconds sequenceNumber createdAt'
+      );
+    }
+    const followUps = await followUpsQuery.lean();
 
     const leadIds = [...new Set(followUps.map((f) => f.leadId.toString()))];
-    const recordingIds = followUps
-      .map((f) => f.callRecordingId?.toString())
-      .filter((id): id is string => Boolean(id));
+    const recordingIds = scheduledOnly
+      ? []
+      : followUps.map((f) => f.callRecordingId?.toString()).filter((id): id is string => Boolean(id));
 
     const [leads, recordings] = await Promise.all([
-      Lead.find({ _id: { $in: leadIds } }),
-      recordingIds.length > 0 ? CallRecording.find({ _id: { $in: recordingIds } }) : [],
+      Lead.find({ _id: { $in: leadIds } })
+        .select('companyName contactPerson contactMobile')
+        .lean(),
+      recordingIds.length > 0 ? CallRecording.find({ _id: { $in: recordingIds } }).lean() : [],
     ]);
 
     const leadById = new Map(leads.map((l) => [l._id.toString(), l]));
@@ -60,9 +69,9 @@ followUpsRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunct
     const data = await Promise.all(
       followUps.map((f) =>
         formatFollowUp(
-          f,
-          leadById.get(f.leadId.toString()),
-          f.callRecordingId ? recordingById.get(f.callRecordingId.toString()) : null
+          f as unknown as ILeadFollowUp,
+          leadById.get(f.leadId.toString()) as ILead | undefined,
+          f.callRecordingId ? (recordingById.get(f.callRecordingId.toString()) as never) : null
         )
       )
     );
@@ -146,6 +155,7 @@ export async function upsertLeadFollowUp(params: {
   }
 
   await syncLeadLegacyFollowUpFields(leadId);
+  invalidateDashboards(userId);
 
   let recording = callRecordingId ? await CallRecording.findById(callRecordingId) : null;
   if (!recording && followUp.callRecordingId) {

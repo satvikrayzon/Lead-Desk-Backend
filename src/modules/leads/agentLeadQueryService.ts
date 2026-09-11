@@ -1,175 +1,34 @@
-import { PipelineStage, Types } from 'mongoose';
-import { Lead, LeadAssignment, LeadFollowUp, User } from '../../models';
+import { Types } from 'mongoose';
+import { Lead, LeadFollowUp, User } from '../../models';
 import { ILead } from '../../models/Lead';
 import { formatLead } from '../../utils/helpers';
 import { dateKeyIst, startOfIstDay } from '../../utils/istCalendar';
+import { leadMatchesSearch, loadAssignmentLeadRows } from '../../services/assignmentLeadLite';
 import { AgentLeadQuery } from './leadListFilters';
 
 function tomorrowIst(): Date {
   return new Date(startOfIstDay().getTime() + 24 * 60 * 60 * 1000);
 }
 
-/** Never dialed (no callCount / lastCalledAt). */
-function neverWorkedMatch(): Record<string, unknown> {
-  return {
-    $and: [
-      { $or: [{ 'lead.callCount': { $exists: false } }, { 'lead.callCount': null }, { 'lead.callCount': 0 }] },
-      { $or: [{ 'lead.lastCalledAt': { $exists: false } }, { 'lead.lastCalledAt': null }] },
-    ],
-  };
+function neverWorked(lead: ILead): boolean {
+  return !(lead.callCount && lead.callCount > 0) && !lead.lastCalledAt;
 }
 
-function workedMatch(): Record<string, unknown> {
-  return {
-    $or: [{ 'lead.callCount': { $gt: 0 } }, { 'lead.lastCalledAt': { $ne: null } }],
-  };
+function worked(lead: ILead): boolean {
+  return (lead.callCount ?? 0) > 0 || Boolean(lead.lastCalledAt);
 }
 
-/**
- * Remaining tab: never worked OR lead has a follow-up overdue/due today.
- * Inclusion is by lead ID from LeadFollowUp — not only Lead.nextFollowupDate
- * (legacy denormalized field is often missing/stale).
- */
-function remainingTabMatch(dueFollowUpLeadIds: Types.ObjectId[]): Record<string, unknown> {
-  if (dueFollowUpLeadIds.length === 0) {
-    return neverWorkedMatch();
-  }
-  return {
-    $or: [neverWorkedMatch(), { 'lead._id': { $in: dueFollowUpLeadIds } }],
-  };
-}
-
-function calledTabMatch(): Record<string, unknown> {
-  return workedMatch();
-}
-
-function buildLeadFieldFilters(query: AgentLeadQuery): Record<string, unknown> {
-  const match: Record<string, unknown> = {};
-  if (query.lead_status) match['lead.leadStatus'] = query.lead_status;
-  if (query.lead_stage) match['lead.leadStage'] = query.lead_stage;
-  if (query.priority) match['lead.priority'] = query.priority;
-  if (query.customer_type) match['lead.customerType'] = query.customer_type;
-  if (query.product) match['lead.product'] = query.product;
-  if (query.state) match['lead.state'] = query.state;
-  if (query.district) match['lead.district'] = query.district;
-  if (query.city) match['lead.city'] = query.city;
-  return match;
-}
-
-function buildSearchMatch(search?: string): Record<string, unknown> | null {
-  if (!search?.trim()) return null;
-  const term = search.trim();
-  const rx = { $regex: term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-  return {
-    $or: [
-      { 'lead.name': rx },
-      { 'lead.phoneNumber': rx },
-      { 'lead.companyName': rx },
-      { 'lead.company': rx },
-      { 'lead.contactPerson': rx },
-      { 'lead.contactMobile': rx },
-      { 'lead.state': rx },
-      { 'lead.district': rx },
-      { 'lead.city': rx },
-      { 'lead.leadCode': rx },
-    ],
-  };
-}
-
-/** Fields needed for tab/filter/sort/search — keep pipeline docs small. */
-const LEAD_LITE_PROJECT = {
-  _id: 1,
-  name: 1,
-  phoneNumber: 1,
-  companyName: 1,
-  company: 1,
-  contactPerson: 1,
-  contactMobile: 1,
-  state: 1,
-  district: 1,
-  city: 1,
-  leadCode: 1,
-  leadStatus: 1,
-  leadStage: 1,
-  priority: 1,
-  customerType: 1,
-  product: 1,
-  status: 1,
-  callCount: 1,
-  lastCalledAt: 1,
-  nextFollowupDate: 1,
-  importBatchId: 1,
-  importRowNumber: 1,
-  createdAt: 1,
-};
-
-function remainingSortStages(overdueIdStrs: string[], dueTodayIdStrs: string[]) {
-  return [
-    {
-      $addFields: {
-        _fuRank: {
-          $switch: {
-            branches: [
-              {
-                case: { $in: [{ $toString: '$lead._id' }, overdueIdStrs] },
-                then: 0,
-              },
-              {
-                case: { $in: [{ $toString: '$lead._id' }, dueTodayIdStrs] },
-                then: 1,
-              },
-            ],
-            default: 2,
-          },
-        },
-        _row: { $ifNull: ['$lead.importRowNumber', 999999999] },
-        _created: { $ifNull: ['$lead.createdAt', '$assignedAt'] },
-      },
-    },
-    {
-      $sort: {
-        // Overdue / due-today follow-ups first, then Excel row order for raw leads.
-        _fuRank: 1 as const,
-        'lead.nextFollowupDate': 1 as const,
-        _row: 1 as const,
-        _created: 1 as const,
-        'lead._id': 1 as const,
-      },
-    },
-  ];
-}
-
-function calledSortStages() {
-  return [
-    {
-      $addFields: {
-        _lastCall: { $ifNull: ['$lead.lastCalledAt', '$assignedAt'] },
-      },
-    },
-    {
-      $sort: {
-        _lastCall: -1 as const,
-        assignedAt: -1 as const,
-        'lead._id': -1 as const,
-      },
-    },
-  ];
-}
-
-function baseLiteLookupPipeline(agentObjectId: Types.ObjectId) {
-  return [
-    { $match: { agentId: agentObjectId, isActive: true } },
-    {
-      $lookup: {
-        from: 'leads',
-        localField: 'leadId',
-        foreignField: '_id',
-        pipeline: [{ $project: LEAD_LITE_PROJECT }],
-        as: 'lead',
-      },
-    },
-    { $unwind: '$lead' },
-  ];
+function matchesFieldFilters(lead: ILead, query: AgentLeadQuery, legacyStatus?: string): boolean {
+  if (query.lead_status && (lead.leadStatus ?? '') !== query.lead_status) return false;
+  if (query.lead_stage && (lead.leadStage ?? '') !== query.lead_stage) return false;
+  if (query.priority && (lead.priority ?? '') !== query.priority) return false;
+  if (query.customer_type && (lead.customerType ?? '') !== query.customer_type) return false;
+  if (query.product && (lead.product ?? '') !== query.product) return false;
+  if (query.state && (lead.state ?? '') !== query.state) return false;
+  if (query.district && (lead.district ?? '') !== query.district) return false;
+  if (query.city && (lead.city ?? '') !== query.city) return false;
+  if (legacyStatus && (lead.status ?? '') !== legacyStatus) return false;
+  return true;
 }
 
 type DueFollowUp = { leadId: Types.ObjectId; nextFollowupDate: Date; overdue: boolean };
@@ -180,7 +39,6 @@ type DueFollowUp = { leadId: Types.ObjectId; nextFollowupDate: Date; overdue: bo
  */
 async function loadDueFollowUpsForAgent(agentObjectId: Types.ObjectId): Promise<DueFollowUp[]> {
   const todayKey = dateKeyIst(new Date());
-  // Wide upper bound so borderline UTC/IST midnights are not dropped early.
   const dayAfterTomorrow = new Date(tomorrowIst().getTime() + 24 * 60 * 60 * 1000);
 
   const rows = await LeadFollowUp.find({
@@ -219,7 +77,6 @@ export async function queryAgentLeadsPage(input: {
   limit: number;
   query: AgentLeadQuery;
   legacyStatus?: string;
-  /** When false (load-more), skip badge counts — client already has them. */
   includeCounts?: boolean;
 }): Promise<{
   data: ReturnType<typeof formatLead>[];
@@ -236,79 +93,65 @@ export async function queryAgentLeadsPage(input: {
   const includeCounts = input.includeCounts !== false;
   const agentObjectId = new Types.ObjectId(userId);
   const skip = (page - 1) * limit;
-
-  const dueFollowUps = await loadDueFollowUpsForAgent(agentObjectId);
-  const dueFollowUpLeadIds = dueFollowUps.map((d) => d.leadId);
-  const overdueIdStrs = dueFollowUps.filter((d) => d.overdue).map((d) => String(d.leadId));
-  const dueTodayIdStrs = dueFollowUps.filter((d) => !d.overdue).map((d) => String(d.leadId));
-
-  // Keep Lead.nextFollowupDate in sync for chips / older clients.
-  if (dueFollowUps.length > 0) {
-    await Lead.bulkWrite(
-      dueFollowUps.map((d) => ({
-        updateOne: {
-          filter: { _id: d.leadId },
-          update: { $set: { nextFollowupDate: d.nextFollowupDate } },
-        },
-      })),
-      { ordered: false }
-    );
-  }
-
-  const fieldFilters = buildLeadFieldFilters(query);
-  const searchMatch = buildSearchMatch(query.search);
-  const extraFilters: Record<string, unknown>[] = [];
-  if (Object.keys(fieldFilters).length) extraFilters.push(fieldFilters);
-  if (searchMatch) extraFilters.push(searchMatch);
-  if (legacyStatus) extraFilters.push({ 'lead.status': legacyStatus });
-
   const tab = query.tab === 'called' ? 'called' : 'remaining';
-  const tabMatch = tab === 'called' ? calledTabMatch() : remainingTabMatch(dueFollowUpLeadIds);
-  const sortStages =
-    tab === 'called' ? calledSortStages() : remainingSortStages(overdueIdStrs, dueTodayIdStrs);
 
-  const facetBranches: Record<string, object[]> = {
-    total: [{ $match: tabMatch }, { $count: 'n' }],
-    pageKeys: [
-      { $match: tabMatch },
-      ...sortStages,
-      { $skip: skip },
-      { $limit: limit },
-      { $project: { leadId: '$lead._id', assignedAt: 1 } },
-    ],
-  };
-
-  if (includeCounts) {
-    facetBranches.remaining = [
-      { $match: remainingTabMatch(dueFollowUpLeadIds) },
-      { $count: 'n' },
-    ];
-    facetBranches.called = [{ $match: calledTabMatch() }, { $count: 'n' }];
-  }
-
-  const pipeline = [
-    ...baseLiteLookupPipeline(agentObjectId),
-    ...(extraFilters.length ? [{ $match: { $and: extraFilters } }] : []),
-    { $facet: facetBranches },
-  ];
-
-  const [agent, aggRows] = await Promise.all([
+  const [dueFollowUps, rows, agent] = await Promise.all([
+    loadDueFollowUpsForAgent(agentObjectId),
+    loadAssignmentLeadRows({ agentId: agentObjectId, isActive: true }),
     User.findById(userId).select('name email teamName').lean(),
-    LeadAssignment.aggregate(pipeline as PipelineStage[]).allowDiskUse(true),
   ]);
 
-  const facet = aggRows[0] ?? { total: [], pageKeys: [], remaining: [], called: [] };
-  const total = facet.total?.[0]?.n ?? 0;
-  const pageKeys = (facet.pageKeys ?? []) as Array<{ leadId: Types.ObjectId; assignedAt: Date }>;
+  const dueIdSet = new Set(dueFollowUps.map((d) => String(d.leadId)));
+  const overdueIdSet = new Set(dueFollowUps.filter((d) => d.overdue).map((d) => String(d.leadId)));
+  const dueTodayIdSet = new Set(dueFollowUps.filter((d) => !d.overdue).map((d) => String(d.leadId)));
+  const dueDateByLead = new Map(dueFollowUps.map((d) => [String(d.leadId), d.nextFollowupDate]));
 
+  const filtered = rows.filter((row) => {
+    if (!matchesFieldFilters(row.lead, query, legacyStatus)) return false;
+    if (!leadMatchesSearch(row.lead, query.search)) return false;
+    return true;
+  });
+
+  const remainingRows = filtered.filter((row) => neverWorked(row.lead) || dueIdSet.has(String(row.leadId)));
+  const calledRows = filtered.filter((row) => worked(row.lead));
+  const tabRows = tab === 'called' ? calledRows : remainingRows;
+
+  const sorted = [...tabRows];
+  if (tab === 'called') {
+    sorted.sort((a, b) => {
+      const la = (a.lead.lastCalledAt ?? a.assignedAt).getTime();
+      const lb = (b.lead.lastCalledAt ?? b.assignedAt).getTime();
+      if (lb !== la) return lb - la;
+      return String(b.leadId).localeCompare(String(a.leadId));
+    });
+  } else {
+    const rank = (id: string) => (overdueIdSet.has(id) ? 0 : dueTodayIdSet.has(id) ? 1 : 2);
+    sorted.sort((a, b) => {
+      const ida = String(a.leadId);
+      const idb = String(b.leadId);
+      const ra = rank(ida);
+      const rb = rank(idb);
+      if (ra !== rb) return ra - rb;
+      const da = a.lead.nextFollowupDate?.getTime() ?? Number.POSITIVE_INFINITY;
+      const db = b.lead.nextFollowupDate?.getTime() ?? Number.POSITIVE_INFINITY;
+      if (da !== db) return da - db;
+      const rowa = a.lead.importRowNumber ?? 999999999;
+      const rowb = b.lead.importRowNumber ?? 999999999;
+      if (rowa !== rowb) return rowa - rowb;
+      const ca = (a.lead.createdAt ?? a.assignedAt).getTime();
+      const cb = (b.lead.createdAt ?? b.assignedAt).getTime();
+      if (ca !== cb) return ca - cb;
+      return ida.localeCompare(idb);
+    });
+  }
+
+  const total = sorted.length;
+  const pageKeys = sorted.slice(skip, skip + limit);
   const leadIds = pageKeys.map((r) => r.leadId);
   const leadDocs =
-    leadIds.length === 0
-      ? []
-      : await Lead.find({ _id: { $in: leadIds } }).lean<ILead[]>();
-
+    leadIds.length === 0 ? [] : await Lead.find({ _id: { $in: leadIds } }).lean<ILead[]>();
   const byId = new Map(leadDocs.map((l) => [String(l._id), l]));
-  const dueDateByLead = new Map(dueFollowUps.map((d) => [String(d.leadId), d.nextFollowupDate]));
+
   const data = pageKeys
     .map((row) => {
       const lead = byId.get(String(row.leadId));
@@ -334,45 +177,30 @@ export async function queryAgentLeadsPage(input: {
   };
 
   if (includeCounts) {
-    meta.remaining_count = facet.remaining?.[0]?.n ?? 0;
-    meta.called_count = facet.called?.[0]?.n ?? 0;
+    meta.remaining_count = remainingRows.length;
+    meta.called_count = calledRows.length;
   }
 
   return { data, meta };
 }
 
-/** Distinct filter values without loading every lead into Node. */
 export async function queryAgentFilterOptions(userId: string) {
-  const agentObjectId = new Types.ObjectId(userId);
-  const rows = await LeadAssignment.aggregate([
-    ...(baseLiteLookupPipeline(agentObjectId) as PipelineStage[]),
-    {
-      $group: {
-        _id: null,
-        states: { $addToSet: '$lead.state' },
-        districts: { $addToSet: '$lead.district' },
-        cities: { $addToSet: '$lead.city' },
-        lead_statuses: { $addToSet: { $ifNull: ['$lead.leadStatus', 'Open'] } },
-        lead_stages: { $addToSet: '$lead.leadStage' },
-        priorities: { $addToSet: '$lead.priority' },
-        customer_types: { $addToSet: '$lead.customerType' },
-        products: { $addToSet: '$lead.product' },
-      },
-    },
-  ] as PipelineStage[]).allowDiskUse(true);
+  const rows = await loadAssignmentLeadRows({
+    agentId: new Types.ObjectId(userId),
+    isActive: true,
+  });
 
   const uniq = (values: unknown[]) =>
     [...new Set(values.filter((v): v is string => typeof v === 'string' && v.trim().length > 0))].sort();
 
-  const g = rows[0] ?? {};
   return {
-    states: uniq(g.states ?? []),
-    districts: uniq(g.districts ?? []),
-    cities: uniq(g.cities ?? []),
-    lead_statuses: uniq(g.lead_statuses ?? []),
-    lead_stages: uniq(g.lead_stages ?? []),
-    priorities: uniq(g.priorities ?? []),
-    customer_types: uniq(g.customer_types ?? []),
-    products: uniq(g.products ?? []),
+    states: uniq(rows.map((r) => r.lead.state)),
+    districts: uniq(rows.map((r) => r.lead.district)),
+    cities: uniq(rows.map((r) => r.lead.city)),
+    lead_statuses: uniq(rows.map((r) => r.lead.leadStatus ?? 'Open')),
+    lead_stages: uniq(rows.map((r) => r.lead.leadStage)),
+    priorities: uniq(rows.map((r) => r.lead.priority)),
+    customer_types: uniq(rows.map((r) => r.lead.customerType)),
+    products: uniq(rows.map((r) => r.lead.product)),
   };
 }

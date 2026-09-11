@@ -190,31 +190,37 @@ async function fetchExportRows(query: AuthRequest['query'], options: { applyTab?
   return rows;
 }
 
+let filtersCache: { expiresAt: number; data: unknown } | null = null;
+
 adminRouter.get('/leads/filters', async (_req: AuthRequest, res: Response, next: NextFunction) => {
   try {
+    if (filtersCache && filtersCache.expiresAt > Date.now()) {
+      return res.json({ data: filtersCache.data });
+    }
     const [states, districts, telecallers, teams] = await Promise.all([
       Lead.distinct('state', { state: { $ne: null } }),
       Lead.distinct('district', { district: { $ne: null } }),
       User.find({ role: { $in: ['agent', 'manager'] }, isActive: true })
         .select('name teamId teamName role')
-        .sort({ name: 1 }),
-      Team.find().select('name').sort({ name: 1 }),
+        .sort({ name: 1 })
+        .lean(),
+      Team.find().select('name').sort({ name: 1 }).lean(),
     ]);
 
-    res.json({
-      data: {
-        states: states.filter(Boolean).sort(),
-        districts: districts.filter(Boolean).sort(),
-        sales_executives: telecallers.map((a) => ({
-          id: a._id.toString(),
-          name: a.name,
-          team_id: a.teamId?.toString() ?? null,
-          team_name: a.teamName ?? null,
-          role: a.role,
-        })),
-        teams: teams.map((t) => ({ id: t._id.toString(), name: t.name })),
-      },
-    });
+    const data = {
+      states: states.filter(Boolean).sort(),
+      districts: districts.filter(Boolean).sort(),
+      sales_executives: telecallers.map((a) => ({
+        id: a._id.toString(),
+        name: a.name,
+        team_id: a.teamId?.toString() ?? null,
+        team_name: a.teamName ?? null,
+        role: a.role,
+      })),
+      teams: teams.map((t) => ({ id: t._id.toString(), name: t.name })),
+    };
+    filtersCache = { expiresAt: Date.now() + 60_000, data };
+    res.json({ data });
   } catch (err) {
     next(err);
   }

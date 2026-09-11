@@ -2,7 +2,6 @@ import { Router, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { Types } from 'mongoose';
 import { CallRecording, Lead, LeadAssignment, LeadFollowUp, User } from '../../models';
-import { ILead } from '../../models/Lead';
 import { AuthRequest } from '../../middleware/auth';
 import { AppError } from '../../middleware/errorHandler';
 import { createAuditLog, formatLead } from '../../utils/helpers';
@@ -19,7 +18,14 @@ import {
   buildTelecallerPerformanceDashboard,
   loadCompanyDials,
 } from '../../services/telecallerPerformanceService';
-import { isRemainingAssignment } from '../leads/leadListFilters';
+import {
+  withAdminDashCache,
+} from '../../services/dashboardCache';
+import {
+  isPendingLead,
+  loadAssignmentLeadRows,
+  loadAssignmentStatsByAgent,
+} from '../../services/assignmentLeadLite';
 
 export const adminDashboardRouter = Router();
 
@@ -87,31 +93,55 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       throw new AppError(400, 'Invalid date range.');
     }
 
+    const cacheKey = `${days}|${rangeStart.toISOString()}|${rangeEndExclusive.toISOString()}`;
+    const data = await withAdminDashCache(cacheKey, async () => {
     const agents = await User.find({
       role: { $in: ['agent', 'manager'] },
       isActive: true,
     })
       .select('name email role teamId teamName')
-      .sort({ name: 1 });
+      .sort({ name: 1 })
+      .lean();
     const activeAgentIds = agents.map((a) => a._id);
+    if (activeAgentIds.length === 0) {
+      const empty = {
+        range: {
+          from: dateKey(rangeStart),
+          to: dateKey(new Date(rangeEndExclusive.getTime() - 1)),
+          days,
+        },
+        summary: {
+          total_leads: 0,
+          total_telecallers: 0,
+          calls_today: 0,
+          pending_leads: 0,
+          calls_last_7_days: 0,
+          talk_seconds_today: 0,
+          talk_seconds_last_7_days: 0,
+          avg_form_fill_seconds_today: 0,
+          avg_form_fill_seconds_last_7_days: 0,
+          form_fills_today: 0,
+          form_fills_last_7_days: 0,
+          overdue_followups: 0,
+          due_today_followups: 0,
+          connected_calls_in_range: 0,
+          recordings_uploaded_in_range: 0,
+          recording_coverage_percent: 0,
+          idle_telecallers_today: 0,
+        },
+        alerts: [],
+        call_outcomes: [],
+        leaderboard: [],
+        overdue_followups: [],
+        calls_by_day: [],
+        telecallers: [],
+      };
+      return empty;
+    }
 
-    const [
-      assignments,
-      dialsToday,
-      dialsRange,
-      overdueFollowUps,
-      dueTodayFollowUps,
-      formFillsToday,
-      formFillsRange,
-      followUpsRange,
-    ] = await Promise.all([
-      // Only fields needed for Remaining/Called — full lead hydrate was timing out admin dashboard.
-      LeadAssignment.find({ isActive: true, agentId: { $in: activeAgentIds } })
-        .select('leadId agentId')
-        .populate<{ leadId: ILead }>('leadId', 'callCount lastCalledAt nextFollowupDate')
-        .lean(),
-      loadCompanyDials(todayStart, tomorrowStart),
-      loadCompanyDials(rangeStart, rangeEndExclusive),
+    const [assignmentStats, dialsRange, overdueFollowUps, dueTodayFollowUps, followUpsRange] = await Promise.all([
+      loadAssignmentStatsByAgent(activeAgentIds as Types.ObjectId[], tomorrowStart),
+      loadCompanyDials(rangeStart, rangeEndExclusive, activeAgentIds),
       LeadFollowUp.find({
         agentId: { $in: activeAgentIds },
         nextFollowupDate: { $ne: null, $lt: todayStart },
@@ -130,50 +160,32 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         .lean(),
       LeadFollowUp.find({
         agentId: { $in: activeAgentIds },
-        createdAt: { $gte: todayStart, $lt: tomorrowStart },
-        formFillSeconds: { $ne: null, $gte: 0 },
-      })
-        .select('agentId formFillSeconds')
-        .lean(),
-      LeadFollowUp.find({
-        agentId: { $in: activeAgentIds },
-        createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
-        formFillSeconds: { $ne: null, $gte: 0 },
-      })
-        .select('agentId formFillSeconds')
-        .lean(),
-      LeadFollowUp.find({
-        agentId: { $in: activeAgentIds },
         createdAt: { $gte: rangeStart, $lt: rangeEndExclusive },
       })
-        .select('agentId')
+        .select('agentId formFillSeconds createdAt')
         .lean(),
     ]);
 
     const overdueLeadIds = new Set(overdueFollowUps.map((f) => refId(f.leadId)).filter(Boolean));
-    const dueTodayLeadIds = new Set(dueTodayFollowUps.map((f) => refId(f.leadId)).filter(Boolean));
-    const pendingLeadIds = new Set<string>();
-    for (const a of assignments) {
-      const lead = a.leadId as ILead | null;
-      if (!lead) continue;
-      const id = String(lead._id);
-      // Same Remaining rule as My Leads (incl. due today / overdue follow-ups).
-      if (isRemainingAssignment(lead) || overdueLeadIds.has(id) || dueTodayLeadIds.has(id)) {
-        pendingLeadIds.add(id);
-      }
-    }
 
     const assignedByAgent = new Map<string, number>();
     const pendingByAgent = new Map<string, number>();
-    for (const a of assignments) {
-      if (!a.leadId) continue;
-      const aid = String(a.agentId);
-      const lid = String((a.leadId as ILead)._id);
-      assignedByAgent.set(aid, (assignedByAgent.get(aid) ?? 0) + 1);
-      if (pendingLeadIds.has(lid)) {
-        pendingByAgent.set(aid, (pendingByAgent.get(aid) ?? 0) + 1);
-      }
+    let totalLeads = 0;
+    let pendingLeadsTotal = 0;
+    for (const [aid, row] of assignmentStats) {
+      assignedByAgent.set(aid, row.assigned);
+      pendingByAgent.set(aid, row.remaining);
+      totalLeads += row.assigned;
+      pendingLeadsTotal += row.remaining;
     }
+
+    const dialsToday = dialsRange.filter((c) => c.startTime >= todayStart && c.startTime < tomorrowStart);
+    const formFillsToday = followUpsRange.filter(
+      (f) => f.createdAt >= todayStart && f.createdAt < tomorrowStart && typeof f.formFillSeconds === 'number' && f.formFillSeconds >= 0
+    );
+    const formFillsRange = followUpsRange.filter(
+      (f) => typeof f.formFillSeconds === 'number' && f.formFillSeconds >= 0
+    );
 
     const callsTodayByAgent = new Map<string, number>();
     const talkTodayByAgent = new Map<string, number>();
@@ -371,44 +383,45 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       });
     }
 
-    res.json({
-      data: {
-        range: {
-          from: dateKey(rangeStart),
-          to: dateKey(new Date(rangeEndExclusive.getTime() - 1)),
-          days,
-        },
-        summary: {
-          total_leads: assignments.filter((a) => a.leadId).length,
-          total_telecallers: agents.length,
-          calls_today: dialsToday.length,
-          pending_leads: pendingLeadIds.size,
-          calls_last_7_days: dialsRange.length,
-          talk_seconds_today: talkSecondsToday,
-          talk_seconds_last_7_days: talkSecondsRange,
-          avg_form_fill_seconds_today: fillToday.companyAvg,
-          avg_form_fill_seconds_last_7_days: fillRange.companyAvg,
-          form_fills_today: fillToday.count,
-          form_fills_last_7_days: fillRange.count,
-          overdue_followups: overdueLeadIds.size,
-          due_today_followups: dueTodayFollowUps.length,
-          connected_calls_in_range: connectedCalls,
-          recordings_uploaded_in_range: recordingsUploaded,
-          recording_coverage_percent: recordingCoveragePercent,
-          idle_telecallers_today: idleTelecallersToday,
-        },
-        alerts,
-        call_outcomes: callOutcomes,
-        leaderboard,
-        overdue_followups: overdueList,
-        calls_by_day: Object.entries(dayBuckets).map(([date, v]) => ({
-          date,
-          count: v.count,
-          talk_seconds: v.talk_seconds,
-        })),
-        telecallers,
+    const payload = {
+      range: {
+        from: dateKey(rangeStart),
+        to: dateKey(new Date(rangeEndExclusive.getTime() - 1)),
+        days,
       },
+      summary: {
+        total_leads: totalLeads,
+        total_telecallers: agents.length,
+        calls_today: dialsToday.length,
+        pending_leads: pendingLeadsTotal,
+        calls_last_7_days: dialsRange.length,
+        talk_seconds_today: talkSecondsToday,
+        talk_seconds_last_7_days: talkSecondsRange,
+        avg_form_fill_seconds_today: fillToday.companyAvg,
+        avg_form_fill_seconds_last_7_days: fillRange.companyAvg,
+        form_fills_today: fillToday.count,
+        form_fills_last_7_days: fillRange.count,
+        overdue_followups: overdueLeadIds.size,
+        due_today_followups: dueTodayFollowUps.length,
+        connected_calls_in_range: connectedCalls,
+        recordings_uploaded_in_range: recordingsUploaded,
+        recording_coverage_percent: recordingCoveragePercent,
+        idle_telecallers_today: idleTelecallersToday,
+      },
+      alerts,
+      call_outcomes: callOutcomes,
+      leaderboard,
+      overdue_followups: overdueList,
+      calls_by_day: Object.entries(dayBuckets).map(([date, v]) => ({
+        date,
+        count: v.count,
+        talk_seconds: v.talk_seconds,
+      })),
+      telecallers,
+    };
+    return payload;
     });
+    res.json({ data });
   } catch (err) {
     next(err);
   }
@@ -838,42 +851,41 @@ adminDashboardRouter.get('/follow-ups', async (req: AuthRequest, res: Response, 
 adminDashboardRouter.get('/pending-leads', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const agentId = typeof req.query.agent_id === 'string' ? req.query.agent_id : null;
+    const limitRaw = Number(req.query.limit ?? 40);
+    const limit = Number.isFinite(limitRaw) ? Math.min(50, Math.max(1, limitRaw)) : 40;
+    const tomorrowStart = endOfDayExclusive(startOfDay());
 
-    const assignmentFilter: Record<string, unknown> = { isActive: true };
-    if (agentId) assignmentFilter.agentId = agentId;
+    const match: Record<string, unknown> = { isActive: true };
+    if (agentId && Types.ObjectId.isValid(agentId)) {
+      match.agentId = new Types.ObjectId(agentId);
+    }
 
-    const assignments = await LeadAssignment.find(assignmentFilter)
-      .populate('leadId')
-      .populate('agentId', 'name email teamName');
+    const rows = await loadAssignmentLeadRows(match);
+    const pending = rows
+      .filter((row) => isPendingLead(row.lead, tomorrowStart))
+      .sort((a, b) => b.assignedAt.getTime() - a.assignedAt.getTime())
+      .slice(0, limit);
 
-    const leadIds = assignments.map((a) => a.leadId).filter(Boolean).map((l) => (l as { _id: Types.ObjectId })._id);
-    const called = new Set(
-      (await CallRecording.distinct('leadId', { leadId: { $in: leadIds } })).map((id) => id.toString())
-    );
-    const overdue = new Set(
-      (
-        await LeadFollowUp.find({
-          leadId: { $in: leadIds },
-          nextFollowupDate: { $ne: null, $lte: new Date() },
-        }).select('leadId')
-      ).map((f) => f.leadId.toString())
-    );
+    const leadIds = pending.map((r) => r.leadId);
+    const agentIds = [...new Set(pending.map((r) => String(r.agentId)))].map((id) => new Types.ObjectId(id));
+    const [leadDocs, agents] = await Promise.all([
+      leadIds.length === 0 ? Promise.resolve([]) : Lead.find({ _id: { $in: leadIds } }).lean(),
+      agentIds.length === 0
+        ? Promise.resolve([])
+        : User.find({ _id: { $in: agentIds } }).select('name email teamName').lean(),
+    ]);
+    const leadById = new Map(leadDocs.map((l) => [String(l._id), l]));
+    const agentById = new Map(agents.map((a) => [String(a._id), a]));
 
-    const data = assignments
-      .filter((a) => a.leadId && a.agentId)
-      .filter((a) => {
-        const id = (a.leadId as { _id: Types.ObjectId })._id.toString();
-        return !called.has(id) || overdue.has(id);
-      })
-      .map((a) => {
-        const lead = a.leadId as unknown as import('../../models/Lead').ILead;
-        const agent = a.agentId as unknown as { _id: Types.ObjectId; name: string; email: string; teamName?: string };
-        const id = lead._id.toString();
-        return {
-          ...formatLead(lead, a.assignedAt, agent as never),
-          pending_reason: !called.has(id) ? 'never_called' : 'followup_due',
-        };
-      });
+    const data = pending.map((row) => {
+      const lead = leadById.get(String(row.leadId)) ?? row.lead;
+      const agent = agentById.get(String(row.agentId));
+      const neverCalled = !(lead.callCount && lead.callCount > 0) && !lead.lastCalledAt;
+      return {
+        ...formatLead(lead as import('../../models/Lead').ILead, row.assignedAt, agent as never),
+        pending_reason: neverCalled ? 'never_called' : 'followup_due',
+      };
+    });
 
     res.json({ data });
   } catch (err) {
