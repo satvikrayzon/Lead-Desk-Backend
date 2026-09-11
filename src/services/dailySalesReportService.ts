@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
 import { Types } from 'mongoose';
 import { CallRecording, Lead, LeadAssignment, LeadFollowUp, RemoteCall, User } from '../models';
+import { withAdminDashCache } from './dashboardCache';
 
 export type DailySalesReport = {
   employee: {
@@ -603,16 +604,20 @@ export async function buildAllDailySalesReports(
   rangeStart: Date,
   rangeEndExclusive: Date
 ): Promise<DailySalesReport[]> {
-  const agents = await User.find({
-    role: { $in: ['agent', 'manager'] },
-    isActive: true,
-  })
-    .select('_id')
-    .sort({ name: 1 });
+  const cacheKey = `sales|${rangeStart.toISOString()}|${rangeEndExclusive.toISOString()}`;
+  const data = await withAdminDashCache(cacheKey, async () => {
+    const agents = await User.find({
+      role: { $in: ['agent', 'manager'] },
+      isActive: true,
+    })
+      .select('_id')
+      .sort({ name: 1 });
 
-  return Promise.all(
-    agents.map((agent) => buildDailySalesReport(agent._id.toString(), rangeStart, rangeEndExclusive))
-  );
+    return Promise.all(
+      agents.map((agent) => buildDailySalesReport(agent._id.toString(), rangeStart, rangeEndExclusive))
+    );
+  });
+  return data as DailySalesReport[];
 }
 
 export function formatDailySalesReportText(report: DailySalesReport): string {

@@ -22,9 +22,9 @@ import {
   withAdminDashCache,
 } from '../../services/dashboardCache';
 import {
-  isPendingLead,
-  loadAssignmentLeadRows,
+  hydratePendingLeads,
   loadAssignmentStatsByAgent,
+  loadPendingAssignmentKeys,
 } from '../../services/assignmentLeadLite';
 
 export const adminDashboardRouter = Router();
@@ -135,11 +135,13 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         overdue_followups: [],
         calls_by_day: [],
         telecallers: [],
+        pending_leads: [],
       };
       return empty;
     }
 
-    const [assignmentStats, dialsRange, overdueFollowUps, dueTodayFollowUps, followUpsRange] = await Promise.all([
+    const [assignmentStats, dialsRange, overdueFollowUps, dueTodayFollowUps, followUpsRange, pendingKeys] =
+      await Promise.all([
       loadAssignmentStatsByAgent(activeAgentIds as Types.ObjectId[], tomorrowStart),
       loadCompanyDials(rangeStart, rangeEndExclusive, activeAgentIds),
       LeadFollowUp.find({
@@ -164,7 +166,10 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       })
         .select('agentId formFillSeconds createdAt')
         .lean(),
+      loadPendingAssignmentKeys({ isActive: true, agentId: { $in: activeAgentIds } }, tomorrowStart, 40),
     ]);
+
+    const pendingLeadsPreview = await hydratePendingLeads(pendingKeys);
 
     const overdueLeadIds = new Set(overdueFollowUps.map((f) => refId(f.leadId)).filter(Boolean));
 
@@ -418,6 +423,7 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         talk_seconds: v.talk_seconds,
       })),
       telecallers,
+      pending_leads: pendingLeadsPreview,
     };
     return payload;
     });
@@ -860,32 +866,8 @@ adminDashboardRouter.get('/pending-leads', async (req: AuthRequest, res: Respons
       match.agentId = new Types.ObjectId(agentId);
     }
 
-    const rows = await loadAssignmentLeadRows(match);
-    const pending = rows
-      .filter((row) => isPendingLead(row.lead, tomorrowStart))
-      .sort((a, b) => b.assignedAt.getTime() - a.assignedAt.getTime())
-      .slice(0, limit);
-
-    const leadIds = pending.map((r) => r.leadId);
-    const agentIds = [...new Set(pending.map((r) => String(r.agentId)))].map((id) => new Types.ObjectId(id));
-    const [leadDocs, agents] = await Promise.all([
-      leadIds.length === 0 ? Promise.resolve([]) : Lead.find({ _id: { $in: leadIds } }).lean(),
-      agentIds.length === 0
-        ? Promise.resolve([])
-        : User.find({ _id: { $in: agentIds } }).select('name email teamName').lean(),
-    ]);
-    const leadById = new Map(leadDocs.map((l) => [String(l._id), l]));
-    const agentById = new Map(agents.map((a) => [String(a._id), a]));
-
-    const data = pending.map((row) => {
-      const lead = leadById.get(String(row.leadId)) ?? row.lead;
-      const agent = agentById.get(String(row.agentId));
-      const neverCalled = !(lead.callCount && lead.callCount > 0) && !lead.lastCalledAt;
-      return {
-        ...formatLead(lead as import('../../models/Lead').ILead, row.assignedAt, agent as never),
-        pending_reason: neverCalled ? 'never_called' : 'followup_due',
-      };
-    });
+    const pendingKeys = await loadPendingAssignmentKeys(match, tomorrowStart, limit);
+    const data = await hydratePendingLeads(pendingKeys);
 
     res.json({ data });
   } catch (err) {
