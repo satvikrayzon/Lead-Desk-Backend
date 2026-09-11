@@ -113,8 +113,13 @@ recordingsRouter.post(
           });
         } else {
           await saveLocalRecording(s3Key, req.file.buffer);
+          if (!resolveExistingLocalRecordingPath(s3Key)) {
+            throw new Error(`File missing after write key=${s3Key}`);
+          }
         }
-      } catch {
+      } catch (storeErr) {
+        // eslint-disable-next-line no-console
+        console.error('[recordings] store failed', storeErr);
         throw new AppError(500, 'Failed to store recording.');
       }
 

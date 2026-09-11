@@ -9,7 +9,10 @@ type RecordingLike = {
   s3Key?: string;
 };
 
-/** Public playback URL, or null when the audio file is not actually stored. */
+/** Public playback URL, or null when the audio file is not actually stored.
+ * Always returns the API file route for local storage — never the raw s3Key
+ * (clients were trying to GET `/lead-desk/recordings/.../*.m4a` and 404ing).
+ */
 export async function publicRecordingUrl(recording: RecordingLike): Promise<string | null> {
   if (recording.uploadStatus !== 'uploaded') return null;
   const key = recording.s3Key;
