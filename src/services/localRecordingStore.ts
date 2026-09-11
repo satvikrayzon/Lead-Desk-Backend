@@ -51,6 +51,14 @@ export async function saveLocalRecording(relativeKey: string, body: Buffer): Pro
   const fullPath = path.join(recordingsBaseDir(), normalizeKey(relativeKey));
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
   await fs.writeFile(fullPath, body);
+  // Ensure bytes are durable before we return recording_id to clients.
+  try {
+    const fh = await fs.open(fullPath, 'r+');
+    await fh.sync();
+    await fh.close();
+  } catch {
+    // sync may be unsupported on some FS; existence check below still applies.
+  }
   if (!existsSync(fullPath) || body.length === 0) {
     throw new Error(`Recording write failed for ${fullPath} (bytes=${body.length})`);
   }

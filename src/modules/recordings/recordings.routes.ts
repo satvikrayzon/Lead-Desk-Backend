@@ -1,5 +1,5 @@
 import { Router, Response, NextFunction } from 'express';
-import { createReadStream } from 'fs';
+import { createReadStream, statSync } from 'fs';
 import { CallRecording, Lead } from '../../models';
 import { linkFollowUpsToRecording } from '../../utils/linkFollowUpRecording';
 import { env } from '../../config/env';
@@ -316,8 +316,33 @@ recordingsRouter.get('/:recordingId/file', async (req: AuthRequest, res: Respons
       );
     }
 
-    res.setHeader('Content-Type', recording.mimeType || 'audio/mp4');
+    const size = statSync(filePath).size;
+    const contentType = recording.mimeType || 'audio/mp4';
+    res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=60');
+
+    const range = req.headers.range;
+    if (range) {
+      const match = /bytes=(\d*)-(\d*)/.exec(range);
+      if (match) {
+        const start = match[1] ? parseInt(match[1], 10) : 0;
+        const end = match[2] ? parseInt(match[2], 10) : Math.max(size - 1, 0);
+        if (start >= size) {
+          res.status(416).setHeader('Content-Range', `bytes */${size}`);
+          return res.end();
+        }
+        const safeEnd = Math.min(end, size - 1);
+        const chunk = safeEnd - start + 1;
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${safeEnd}/${size}`);
+        res.setHeader('Content-Length', chunk);
+        createReadStream(filePath, { start, end: safeEnd }).pipe(res);
+        return;
+      }
+    }
+
+    res.setHeader('Content-Length', size);
     createReadStream(filePath).pipe(res);
   } catch (err) {
     next(err);
