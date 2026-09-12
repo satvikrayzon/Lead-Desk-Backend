@@ -4,6 +4,7 @@ import { ILead } from '../../models/Lead';
 import { formatLead } from '../../utils/helpers';
 import { dateKeyIst, startOfIstDay } from '../../utils/istCalendar';
 import { ensureAssignmentListBackfill } from '../../services/assignmentListSync';
+import { attachLeadResults } from '../../services/leadResultAttach';
 import { AgentLeadQuery } from './leadListFilters';
 
 function tomorrowIst(): Date {
@@ -192,6 +193,7 @@ export async function queryAgentLeadsPage(input: {
   const leadIds = pageRows.map((r) => r.leadId);
   const leadDocs =
     leadIds.length === 0 ? ([] as ILead[]) : await Lead.find({ _id: { $in: leadIds } }).lean<ILead[]>();
+  await attachLeadResults(leadDocs);
   const leadById = new Map(leadDocs.map((l) => [String(l._id), l]));
   const assignByLead = new Map(pageRows.map((r) => [String(r.leadId), r]));
 

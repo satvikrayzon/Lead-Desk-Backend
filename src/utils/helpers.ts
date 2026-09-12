@@ -126,6 +126,8 @@ export interface LeadResponse {
 
   remarks: string | null;
 
+  lead_result: string | null;
+
   last_form_fill_seconds: number | null;
 
   avg_form_fill_seconds: number | null;
@@ -307,6 +309,8 @@ export function formatLead(lead: ILead, assignedAt: Date, agent?: IUser | null):
     order_kw: lead.orderKw ?? null,
 
     remarks: lead.remarks ?? null,
+
+    lead_result: lead.leadResult ?? null,
 
     last_form_fill_seconds:
       typeof lead.lastFormFillSeconds === 'number' ? lead.lastFormFillSeconds : null,

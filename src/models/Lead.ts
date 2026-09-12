@@ -127,6 +127,9 @@ export interface ILead extends Document {
 
   remarks?: string;
 
+  /** Comma-separated sales results from follow-up (interested,qualified,…). */
+  leadResult?: string;
+
   /** Most recent follow-up form fill time (seconds). */
   lastFormFillSeconds?: number;
 
@@ -269,6 +272,8 @@ const leadSchema = new Schema<ILead>(
     orderKw: { type: Number },
 
     remarks: { type: String },
+
+    leadResult: { type: String },
 
     lastFormFillSeconds: { type: Number },
 

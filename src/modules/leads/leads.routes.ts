@@ -4,7 +4,7 @@ import { Types } from 'mongoose';
 
 import { z } from 'zod';
 
-import { Lead, LeadAssignment, CallRecording, User } from '../../models';
+import { Lead, LeadAssignment, CallRecording, User, LeadFollowUp } from '../../models';
 
 import { publicRecordingUrl } from '../../utils/recordingUrl';
 
@@ -39,6 +39,8 @@ import { formatImportBatch, importLeadsFromBuffer } from '../../services/excelIm
 import { buildLeadTrackerWorkbook, loadFollowUpsByLeadId } from '../../services/excelExportService';
 
 import { getNextLeadCode } from '../../services/leadCodeService';
+import { syncAssignmentsForLead } from '../../services/assignmentListSync';
+import { invalidateDashboards } from '../../services/dashboardCache';
 
 import {
   filterAgentLeadAssignments,
@@ -367,6 +369,20 @@ const updateLeadSchema = z.object({
 
   city: z.union([z.string(), z.null()]).optional(),
 
+  state: z.union([z.string(), z.null()]).optional(),
+
+  district: z.union([z.string(), z.null()]).optional(),
+
+  address: z.union([z.string(), z.null()]).optional(),
+
+  company_name: z.union([z.string(), z.null()]).optional(),
+
+  contact_mobile: z.union([z.string(), z.null()]).optional(),
+
+  contact_email: z.union([z.string(), z.null()]).optional(),
+
+  current_installation_capacity_kw: z.union([z.number(), z.string(), z.null()]).optional(),
+
   contact_person: z.union([z.string(), z.null()]).optional(),
 
   designation: z.union([z.string(), z.null()]).optional(),
@@ -429,6 +445,8 @@ const updateLeadSchema = z.object({
 
   order_kw: z.union([z.number(), z.string(), z.null()]).optional(),
 
+  lead_result: z.union([z.string(), z.null()]).optional(),
+
   remarks: z.union([z.string(), z.null()]).optional(),
 
 });
@@ -446,6 +464,30 @@ function applyFollowUpFields(lead: ILead, body: z.infer<typeof updateLeadSchema>
 
 
   if (body.city !== undefined) lead.city = str('city');
+
+  if (body.state !== undefined) lead.state = str('state');
+
+  if (body.district !== undefined) lead.district = str('district');
+
+  if (body.address !== undefined) lead.address = str('address');
+
+  if (body.company_name !== undefined) {
+    const company = str('company_name');
+    lead.companyName = company;
+    lead.company = company;
+  }
+
+  if (body.contact_mobile !== undefined) {
+    const mobile = str('contact_mobile');
+    lead.contactMobile = mobile;
+    if (mobile) lead.phoneNumber = mobile;
+  }
+
+  if (body.contact_email !== undefined) lead.contactEmail = str('contact_email');
+
+  if (body.current_installation_capacity_kw !== undefined) {
+    lead.currentInstallationCapacityKw = num('current_installation_capacity_kw');
+  }
 
   if (body.contact_person !== undefined) {
     lead.contactPerson = str('contact_person');
@@ -575,9 +617,10 @@ leadsRouter.patch('/:leadId', async (req: AuthRequest, res: Response, next: Next
 
     const isFollowUpSave = Object.keys(parsed.data).some((k) => k !== 'status' && k !== 'notes');
 
+    // First follow-up create via PATCH still requires remarks; pure lead edits may omit them.
+    const remarksProvided = Object.prototype.hasOwnProperty.call(parsed.data, 'followup_remarks');
 
-
-    if (isFollowUpSave) {
+    if (isFollowUpSave && remarksProvided) {
 
       const remarks = parsed.data.followup_remarks;
 
@@ -624,6 +667,25 @@ leadsRouter.patch('/:leadId', async (req: AuthRequest, res: Response, next: Next
     applyFollowUpFields(lead, parsed.data);
 
     await lead.save();
+
+    if (Object.prototype.hasOwnProperty.call(parsed.data, 'lead_result')) {
+      const encoded = parseOptionalString(parsed.data.lead_result) ?? '';
+      let target =
+        (await LeadFollowUp.findOne({
+          leadId,
+          leadResult: { $exists: true, $nin: [null, ''] },
+        }).sort({ sequenceNumber: 1, createdAt: 1 })) ||
+        (await LeadFollowUp.findOne({ leadId }).sort({ sequenceNumber: 1, createdAt: 1 }));
+      if (target) {
+        target.leadResult = encoded || undefined;
+        await target.save();
+      }
+      lead.leadResult = encoded || undefined;
+      await lead.save();
+      invalidateDashboards(userId);
+    }
+
+    await syncAssignmentsForLead(leadId);
 
 
 

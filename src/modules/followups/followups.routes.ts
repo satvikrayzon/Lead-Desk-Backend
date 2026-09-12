@@ -205,6 +205,11 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
   if (f1) $set.followupRemarks = f1.remarks;
   else if (latest) $set.followupRemarks = latest.remarks;
 
+  // Prefer earliest follow-up that has a sales result (usually 1st call).
+  const withResult = followUps.find((f) => typeof f.leadResult === 'string' && f.leadResult.trim());
+  if (withResult?.leadResult) $set.leadResult = withResult.leadResult.trim();
+  else $unset.leadResult = 1;
+
   if (latest) $set.lastContactDate = latest.createdAt;
 
   const dialFollowUps = followUps.filter((f) => {

@@ -5,6 +5,7 @@ import { CallRecording, Lead, LeadAssignment, User } from '../../models';
 import { ILead } from '../../models/Lead';
 import { formatLead, LeadResponse } from '../../utils/helpers';
 import { ensureAssignmentListBackfill } from '../../services/assignmentListSync';
+import { attachLeadResults } from '../../services/leadResultAttach';
 
 type AssignmentPageRow = {
   leadId: Types.ObjectId;
@@ -284,6 +285,9 @@ export async function queryAdminLeadsPage(input: {
       ? []
       : await User.find({ _id: { $in: agentIds } }).select('name email teamName').lean();
   const agentById = new Map(agents.map((a) => [normalizeId(a._id), a]));
+
+  const leanLeads = hydrated.map((h) => h.lead);
+  await attachLeadResults(leanLeads);
 
   let data = hydrated
     .map(({ row, lead }) => {
