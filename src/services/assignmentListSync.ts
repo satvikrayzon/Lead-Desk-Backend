@@ -20,10 +20,13 @@ export type AssignmentListFields = {
   contactMobile: string | null;
   leadCode: string | null;
   listSyncedAt: Date;
+  listSyncVersion: number;
 };
 
 const LIST_SELECT =
   'callCount lastCalledAt importRowNumber nextFollowupDate state district city leadStatus leadStage priority customerType product companyName company name contactPerson contactMobile phoneNumber leadCode';
+
+export const ASSIGNMENT_LIST_SYNC_VERSION = 2;
 
 export function listFieldsFromLead(lead: Partial<ILead>): AssignmentListFields {
   return {
@@ -44,6 +47,7 @@ export function listFieldsFromLead(lead: Partial<ILead>): AssignmentListFields {
     contactMobile: lead.contactMobile ?? lead.phoneNumber ?? null,
     leadCode: lead.leadCode ?? null,
     listSyncedAt: new Date(),
+    listSyncVersion: ASSIGNMENT_LIST_SYNC_VERSION,
   };
 }
 
@@ -83,6 +87,7 @@ export function listFieldsFromAssignment(row: {
     contactMobile: row.contactMobile ?? null,
     leadCode: row.leadCode ?? null,
     listSyncedAt: new Date(),
+    listSyncVersion: ASSIGNMENT_LIST_SYNC_VERSION,
   };
 }
 
@@ -131,13 +136,24 @@ async function syncBatch(
   const byId = new Map(leads.map((l) => [String(l._id), l]));
   const ops = rows.map((row) => {
     const lead = byId.get(String(row.leadId));
-    const fields = lead
-      ? listFieldsFromLead(lead)
-      : { callCount: 0, lastCalledAt: null, importRowNumber: 999999999, listSyncedAt: new Date() };
+    if (!lead) {
+      return {
+        updateOne: {
+          filter: { _id: row._id },
+          update: {
+            $set: {
+              isActive: false,
+              listSyncedAt: new Date(),
+              listSyncVersion: ASSIGNMENT_LIST_SYNC_VERSION,
+            },
+          },
+        },
+      };
+    }
     return {
       updateOne: {
         filter: { _id: row._id },
-        update: { $set: fields },
+        update: { $set: listFieldsFromLead(lead) },
       },
     };
   });
@@ -149,14 +165,14 @@ async function syncBatch(
 export async function backfillAssignmentListFields(): Promise<void> {
   const unsynced = await LeadAssignment.countDocuments({
     isActive: true,
-    $or: [{ listSyncedAt: { $exists: false } }, { listSyncedAt: null }],
+    listSyncVersion: { $ne: ASSIGNMENT_LIST_SYNC_VERSION },
   });
   if (unsynced === 0) return;
 
   console.log(`[leads] backfilling list fields on ${unsynced} assignments`);
   const cursor = LeadAssignment.find({
     isActive: true,
-    $or: [{ listSyncedAt: { $exists: false } }, { listSyncedAt: null }],
+    listSyncVersion: { $ne: ASSIGNMENT_LIST_SYNC_VERSION },
   })
     .select('leadId')
     .lean()

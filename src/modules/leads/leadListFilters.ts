@@ -12,6 +12,7 @@ export interface AgentLeadQuery {
   state?: string;
   district?: string;
   city?: string;
+  lead_result?: string;
 }
 
 type PopulatedAssignment = { leadId: ILead; assignedAt: Date };
@@ -126,6 +127,7 @@ export function parseAgentLeadQuery(query: Record<string, unknown>): AgentLeadQu
     state: asString(query.state),
     district: asString(query.district),
     city: asString(query.city),
+    lead_result: asString(query.lead_result),
   };
 }
 

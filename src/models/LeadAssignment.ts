@@ -24,6 +24,7 @@ export interface ILeadAssignment extends Document {
   contactMobile?: string | null;
   leadCode?: string | null;
   listSyncedAt?: Date | null;
+  listSyncVersion?: number;
 }
 
 const leadAssignmentSchema = new Schema<ILeadAssignment>(
@@ -50,6 +51,7 @@ const leadAssignmentSchema = new Schema<ILeadAssignment>(
     contactMobile: { type: String, default: null },
     leadCode: { type: String, default: null },
     listSyncedAt: { type: Date, default: null },
+    listSyncVersion: { type: Number, default: 0 },
   },
   { timestamps: false }
 );
@@ -58,11 +60,8 @@ leadAssignmentSchema.index({ agentId: 1, isActive: 1 });
 leadAssignmentSchema.index({ agentId: 1, isActive: 1, assignedAt: -1 });
 leadAssignmentSchema.index({ leadId: 1, agentId: 1, isActive: 1 });
 leadAssignmentSchema.index({ isActive: 1, agentId: 1 });
-leadAssignmentSchema.index({ isActive: 1, callCount: 1, importRowNumber: 1, assignedAt: 1 });
-leadAssignmentSchema.index({ isActive: 1, callCount: 1, lastCalledAt: -1 });
-leadAssignmentSchema.index({ isActive: 1, agentId: 1, callCount: 1, importRowNumber: 1, assignedAt: 1 });
-leadAssignmentSchema.index({ isActive: 1, agentId: 1, callCount: 1, lastCalledAt: -1 });
-leadAssignmentSchema.index({ isActive: 1, listSyncedAt: 1 });
+leadAssignmentSchema.index({ isActive: 1, callCount: 1 });
+leadAssignmentSchema.index({ isActive: 1, listSyncVersion: 1 });
 
 export const LeadAssignment: Model<ILeadAssignment> =
   mongoose.models.LeadAssignment ||

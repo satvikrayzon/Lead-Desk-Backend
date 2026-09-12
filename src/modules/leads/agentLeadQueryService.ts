@@ -37,6 +37,23 @@ function applyAssignmentFilters(match: Record<string, unknown>, query: AgentLead
   }
 }
 
+/** Leads that have at least one follow-up tagged with this sales result. */
+export async function leadIdsForLeadResult(
+  agentObjectId: Types.ObjectId,
+  leadResult: string
+): Promise<Types.ObjectId[]> {
+  const token = leadResult.trim().toLowerCase();
+  if (!token) return [];
+  const rows = await LeadFollowUp.find({
+    agentId: agentObjectId,
+    leadResult: { $regex: `(^|,)\\s*${escapeRegex(token)}\\s*(,|$)`, $options: 'i' },
+  })
+    .select('leadId')
+    .lean();
+  const uniq = [...new Set(rows.map((r) => String(r.leadId)).filter(Boolean))];
+  return uniq.map((id) => new Types.ObjectId(id));
+}
+
 type DueFollowUp = { leadId: Types.ObjectId; nextFollowupDate: Date; overdue: boolean };
 
 async function loadDueFollowUpsForAgent(agentObjectId: Types.ObjectId): Promise<DueFollowUp[]> {
@@ -111,6 +128,24 @@ export async function queryAgentLeadsPage(input: {
 
   const base: Record<string, unknown> = { isActive: true, agentId: agentObjectId };
   applyAssignmentFilters(base, query);
+
+  if (query.lead_result) {
+    const resultLeadIds = await leadIdsForLeadResult(agentObjectId, query.lead_result);
+    if (resultLeadIds.length === 0) {
+      return {
+        data: [],
+        meta: {
+          page,
+          limit,
+          total: 0,
+          total_pages: 1,
+          remaining_count: includeCounts ? 0 : undefined,
+          called_count: includeCounts ? 0 : undefined,
+        },
+      };
+    }
+    base.leadId = { $in: resultLeadIds };
+  }
 
   const remainingClause: Record<string, unknown> =
     dueIds.length === 0

@@ -44,7 +44,7 @@ import {
   filterAgentLeadAssignments,
   parseAgentLeadQuery,
 } from './leadListFilters';
-import { queryAgentFilterOptions, queryAgentLeadsPage } from './agentLeadQueryService';
+import { queryAgentFilterOptions, queryAgentLeadsPage, leadIdsForLeadResult } from './agentLeadQueryService';
 
 import { LeadStatus } from '../../types/enums';
 
@@ -207,13 +207,25 @@ leadsRouter.get('/export', async (req: AuthRequest, res: Response, next: NextFun
 
     );
 
-    const filtered = filterAgentLeadAssignments(
+    const listQuery = parseAgentLeadQuery(req.query as Record<string, unknown>);
+
+    let filtered = filterAgentLeadAssignments(
 
       assignments.map((a) => ({ leadId: a.leadId, assignedAt: a.assignedAt })),
 
-      parseAgentLeadQuery(req.query as Record<string, unknown>)
+      listQuery
 
     );
+
+    if (listQuery.lead_result) {
+
+      const ids = await leadIdsForLeadResult(new Types.ObjectId(userId), listQuery.lead_result);
+
+      const allowed = new Set(ids.map(String));
+
+      filtered = filtered.filter((a) => allowed.has(String(a.leadId._id)));
+
+    }
 
     const followUpsByLead = await loadFollowUpsByLeadId(filtered.map((a) => a.leadId._id));
 

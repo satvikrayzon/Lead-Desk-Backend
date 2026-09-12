@@ -6,6 +6,73 @@ import { ILead } from '../../models/Lead';
 import { formatLead, LeadResponse } from '../../utils/helpers';
 import { ensureAssignmentListBackfill } from '../../services/assignmentListSync';
 
+type AssignmentPageRow = {
+  leadId: Types.ObjectId;
+  agentId: Types.ObjectId;
+  assignedAt: Date;
+};
+
+type HydratedAssignment = { row: AssignmentPageRow; lead: ILead };
+
+function normalizeId(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && value !== null && '_id' in value) {
+    return String((value as { _id: unknown })._id);
+  }
+  return String(value);
+}
+
+async function loadHydratedAssignmentPage(input: {
+  match: Record<string, unknown>;
+  tab: 'remaining' | 'called';
+  skip: number;
+  limit: number;
+}): Promise<HydratedAssignment[]> {
+  const { match, tab, skip, limit } = input;
+  const out: HydratedAssignment[] = [];
+  let hydratedSeen = 0;
+  let offset = 0;
+  let useSort = true;
+  const batchSize = Math.max(limit * 2, 80);
+  const maxScan = skip + limit + 2500;
+
+  while (out.length < limit && offset < maxScan) {
+    const query = LeadAssignment.find(match).select('leadId agentId assignedAt');
+    if (useSort) {
+      if (tab === 'called') query.sort({ lastCalledAt: -1, _id: -1 });
+      else query.sort({ importRowNumber: 1, assignedAt: 1, _id: 1 });
+    }
+    const batch = await query.skip(offset).limit(batchSize).lean<AssignmentPageRow[]>();
+    if (batch.length === 0) {
+      if (useSort && offset === 0) {
+        useSort = false;
+        continue;
+      }
+      break;
+    }
+    offset += batch.length;
+
+    const ids = batch.map((row) => row.leadId).filter((id) => id != null);
+    const leads =
+      ids.length === 0 ? ([] as ILead[]) : await Lead.find({ _id: { $in: ids } }).lean<ILead[]>();
+    const byId = new Map(leads.map((lead) => [normalizeId(lead._id), lead]));
+
+    for (const row of batch) {
+      const lead = byId.get(normalizeId(row.leadId));
+      if (!lead) continue;
+      if (hydratedSeen < skip) {
+        hydratedSeen += 1;
+        continue;
+      }
+      out.push({ row, lead });
+      if (out.length >= limit) break;
+    }
+  }
+
+  return out;
+}
+
 type AdminLeadListItem = LeadResponse & {
   latest_call?: {
     id: string;
@@ -18,12 +85,6 @@ type AdminLeadListItem = LeadResponse & {
     recording_id: string;
     has_recording: boolean;
   };
-};
-
-type AssignmentPageRow = {
-  leadId: Types.ObjectId;
-  agentId: Types.ObjectId;
-  assignedAt: Date;
 };
 
 function escapeRegex(raw: string): string {
@@ -183,7 +244,7 @@ export async function queryAdminLeadsPage(input: {
   const skip = (page - 1) * limit;
   const tab = query.tab === 'called' ? 'called' : 'remaining';
 
-  await ensureAssignmentListBackfill();
+  void ensureAssignmentListBackfill().catch(() => undefined);
 
   const scope = await resolveAssignmentScope(query);
   if (!scope) {
@@ -203,47 +264,30 @@ export async function queryAdminLeadsPage(input: {
   const filters: Record<string, unknown> = { ...scope };
   applyLeadFilters(filters, query);
 
-  const remainingMatch = { ...filters, callCount: { $lte: 0 } };
+  const remainingMatch = { ...filters, $nor: [{ callCount: { $gt: 0 } }] };
   const calledMatch = { ...filters, callCount: { $gt: 0 } };
   const tabMatch = tab === 'called' ? calledMatch : remainingMatch;
-  const pageQuery =
-    tab === 'called'
-      ? LeadAssignment.find(tabMatch)
-          .select('leadId agentId assignedAt')
-          .sort({ lastCalledAt: -1, _id: -1 })
-          .skip(skip)
-          .limit(limit)
-          .lean<AssignmentPageRow[]>()
-      : LeadAssignment.find(tabMatch)
-          .select('leadId agentId assignedAt')
-          .sort({ importRowNumber: 1, assignedAt: 1, _id: 1 })
-          .skip(skip)
-          .limit(limit)
-          .lean<AssignmentPageRow[]>();
 
-  const [pageRows, total, remainingCount, calledCount] = await Promise.all([
-    pageQuery,
+  const [hydrated, total, remainingCount, calledCount] = await Promise.all([
+    loadHydratedAssignmentPage({ match: tabMatch, tab, skip, limit }),
     LeadAssignment.countDocuments(tabMatch),
     includeCounts ? LeadAssignment.countDocuments(remainingMatch) : Promise.resolve(0),
     includeCounts ? LeadAssignment.countDocuments(calledMatch) : Promise.resolve(0),
   ]);
 
-  const leadIds = pageRows.map((r) => r.leadId);
-  const agentIds = [...new Set(pageRows.map((r) => String(r.agentId)))].map((id) => new Types.ObjectId(id));
-  const [leadDocs, agents] = await Promise.all([
-    leadIds.length === 0 ? Promise.resolve([] as ILead[]) : Lead.find({ _id: { $in: leadIds } }).lean(),
+  const pageRows = hydrated.map((item) => item.row);
+  const agentIds = [...new Set(pageRows.map((r) => normalizeId(r.agentId)))]
+    .filter((id) => Types.ObjectId.isValid(id))
+    .map((id) => new Types.ObjectId(id));
+  const agents =
     agentIds.length === 0
-      ? Promise.resolve([])
-      : User.find({ _id: { $in: agentIds } }).select('name email teamName').lean(),
-  ]);
-  const leadById = new Map(leadDocs.map((l) => [String(l._id), l]));
-  const agentById = new Map(agents.map((a) => [String(a._id), a]));
+      ? []
+      : await User.find({ _id: { $in: agentIds } }).select('name email teamName').lean();
+  const agentById = new Map(agents.map((a) => [normalizeId(a._id), a]));
 
-  let data = pageRows
-    .map((row) => {
-      const lead = leadById.get(String(row.leadId));
-      if (!lead) return null;
-      const agent = agentById.get(String(row.agentId));
+  let data = hydrated
+    .map(({ row, lead }) => {
+      const agent = agentById.get(normalizeId(row.agentId));
       const formatted = formatLead(lead as ILead, row.assignedAt, agent as never);
       if (!formatted.sales_executive && agent?.name) formatted.sales_executive = agent.name;
       return formatted;
