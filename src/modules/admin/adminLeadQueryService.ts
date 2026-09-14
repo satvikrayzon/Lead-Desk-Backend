@@ -4,6 +4,7 @@ import { getPresignedUrl } from '../../config/s3';
 import { CallRecording, Lead, LeadAssignment, User } from '../../models';
 import { ILead } from '../../models/Lead';
 import { formatLead, LeadResponse } from '../../utils/helpers';
+import { parseClientCalendarDate, startOfIstDay } from '../../utils/istCalendar';
 import { ensureAssignmentListBackfill } from '../../services/assignmentListSync';
 import { attachLeadResults } from '../../services/leadResultAttach';
 
@@ -92,6 +93,38 @@ function escapeRegex(raw: string): string {
   return raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** Inclusive IST calendar range on assignment `assignedAt` (when lead was added/assigned). */
+export function applyAssignedDateRange(
+  match: Record<string, unknown>,
+  query: Record<string, unknown>
+): void {
+  const fromRaw =
+    (typeof query.date_from === 'string' && query.date_from.trim()) ||
+    (typeof query.from === 'string' && query.from.trim()) ||
+    '';
+  const toRaw =
+    (typeof query.date_to === 'string' && query.date_to.trim()) ||
+    (typeof query.to === 'string' && query.to.trim()) ||
+    '';
+  if (!fromRaw && !toRaw) return;
+
+  const range: { $gte?: Date; $lt?: Date } = {};
+  if (fromRaw) {
+    const from = parseClientCalendarDate(fromRaw);
+    if (!Number.isNaN(from.getTime())) range.$gte = from;
+  }
+  if (toRaw) {
+    const toStart = parseClientCalendarDate(toRaw);
+    if (!Number.isNaN(toStart.getTime())) {
+      // Inclusive end day → exclusive next IST midnight
+      range.$lt = new Date(startOfIstDay(toStart).getTime() + 24 * 60 * 60 * 1000);
+    }
+  }
+  if (range.$gte || range.$lt) {
+    match.assignedAt = range;
+  }
+}
+
 function applyLeadFilters(match: Record<string, unknown>, query: Record<string, unknown>): void {
   if (typeof query.state === 'string' && query.state.trim()) match.state = query.state.trim();
   if (typeof query.district === 'string' && query.district.trim()) match.district = query.district.trim();
@@ -105,6 +138,8 @@ function applyLeadFilters(match: Record<string, unknown>, query: Record<string, 
   if (typeof query.customer_type === 'string' && query.customer_type.trim()) {
     match.customerType = query.customer_type.trim();
   }
+
+  applyAssignedDateRange(match, query);
 
   const search = typeof query.search === 'string' ? query.search.trim() : '';
   if (search) {
