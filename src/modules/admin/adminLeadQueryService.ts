@@ -93,11 +93,9 @@ function escapeRegex(raw: string): string {
   return raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** Inclusive IST calendar range on assignment `assignedAt` (when lead was added/assigned). */
-export function applyAssignedDateRange(
-  match: Record<string, unknown>,
+function parseInclusiveDateRange(
   query: Record<string, unknown>
-): void {
+): { $gte?: Date; $lt?: Date } | null {
   const fromRaw =
     (typeof query.date_from === 'string' && query.date_from.trim()) ||
     (typeof query.from === 'string' && query.from.trim()) ||
@@ -106,7 +104,7 @@ export function applyAssignedDateRange(
     (typeof query.date_to === 'string' && query.date_to.trim()) ||
     (typeof query.to === 'string' && query.to.trim()) ||
     '';
-  if (!fromRaw && !toRaw) return;
+  if (!fromRaw && !toRaw) return null;
 
   const range: { $gte?: Date; $lt?: Date } = {};
   if (fromRaw) {
@@ -116,13 +114,55 @@ export function applyAssignedDateRange(
   if (toRaw) {
     const toStart = parseClientCalendarDate(toRaw);
     if (!Number.isNaN(toStart.getTime())) {
-      // Inclusive end day → exclusive next IST midnight
       range.$lt = new Date(startOfIstDay(toStart).getTime() + 24 * 60 * 60 * 1000);
     }
   }
-  if (range.$gte || range.$lt) {
-    match.assignedAt = range;
+  return range.$gte || range.$lt ? range : null;
+}
+
+/** Inclusive IST calendar range on a LeadAssignment date field. */
+export function applyLeadDateRange(
+  match: Record<string, unknown>,
+  query: Record<string, unknown>,
+  field: 'assignedAt' | 'lastCalledAt' = 'assignedAt'
+): void {
+  const range = parseInclusiveDateRange(query);
+  if (range) match[field] = range;
+}
+
+/** @deprecated Use applyLeadDateRange — kept for export callers that import the old name. */
+export function applyAssignedDateRange(
+  match: Record<string, unknown>,
+  query: Record<string, unknown>
+): void {
+  applyLeadDateRange(match, query, 'assignedAt');
+}
+
+/**
+ * Resolve lead IDs whose last call falls in the date range.
+ * Uses Lead.lastCalledAt (source of truth) plus CallRecording timestamps
+ * so "Today" on the Called tab matches real dials even if assignment sync is stale.
+ */
+export async function resolveCalledLeadIdsInRange(
+  query: Record<string, unknown>
+): Promise<Types.ObjectId[] | null> {
+  const range = parseInclusiveDateRange(query);
+  if (!range) return null;
+
+  const [fromLeads, fromRecordings] = await Promise.all([
+    Lead.find({ lastCalledAt: range }).select('_id').lean(),
+    CallRecording.find({ callStartTime: range }).select('leadId').lean(),
+  ]);
+
+  const ids = new Set<string>();
+  for (const row of fromLeads) ids.add(String(row._id));
+  for (const row of fromRecordings) {
+    if (row.leadId) ids.add(String(row.leadId));
   }
+
+  return [...ids]
+    .filter((id) => Types.ObjectId.isValid(id))
+    .map((id) => new Types.ObjectId(id));
 }
 
 function applyLeadFilters(match: Record<string, unknown>, query: Record<string, unknown>): void {
@@ -139,7 +179,7 @@ function applyLeadFilters(match: Record<string, unknown>, query: Record<string, 
     match.customerType = query.customer_type.trim();
   }
 
-  applyAssignedDateRange(match, query);
+  // Date range is applied per-tab in queryAdminLeadsPage (assignedAt vs lastCalledAt).
 
   const search = typeof query.search === 'string' ? query.search.trim() : '';
   if (search) {
@@ -300,8 +340,18 @@ export async function queryAdminLeadsPage(input: {
   const filters: Record<string, unknown> = { ...scope };
   applyLeadFilters(filters, query);
 
-  const remainingMatch = { ...filters, $nor: [{ callCount: { $gt: 0 } }] };
-  const calledMatch = { ...filters, callCount: { $gt: 0 } };
+  // Raw tab → when lead was assigned/imported.
+  // Called tab → leads actually dialed in the range (Lead.lastCalledAt + recordings).
+  const remainingMatch: Record<string, unknown> = { ...filters, $nor: [{ callCount: { $gt: 0 } }] };
+  applyLeadDateRange(remainingMatch, query, 'assignedAt');
+
+  const calledMatch: Record<string, unknown> = { ...filters, callCount: { $gt: 0 } };
+  const calledLeadIds = await resolveCalledLeadIdsInRange(query);
+  if (calledLeadIds) {
+    // Empty range → no called leads that day.
+    calledMatch.leadId = { $in: calledLeadIds };
+  }
+
   const tabMatch = tab === 'called' ? calledMatch : remainingMatch;
 
   const [hydrated, total, remainingCount, calledCount] = await Promise.all([

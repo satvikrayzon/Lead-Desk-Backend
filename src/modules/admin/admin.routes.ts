@@ -11,7 +11,7 @@ import { ILead } from '../../models/Lead';
 import { adminUsersRouter } from './adminUsers.routes';
 import { adminTeamsRouter } from './adminTeams.routes';
 import { adminDashboardRouter } from './adminDashboard.routes';
-import { applyAssignedDateRange, queryAdminLeadsPage } from './adminLeadQueryService';
+import { applyLeadDateRange, queryAdminLeadsPage, resolveCalledLeadIdsInRange } from './adminLeadQueryService';
 import { assignmentInsertFromLead } from '../../services/assignmentListSync';
 
 export const adminRouter = Router();
@@ -139,7 +139,14 @@ async function fetchExportRows(query: AuthRequest['query'], options: { applyTab?
   const tab = typeof query.tab === 'string' ? query.tab : '';
 
   const assignmentMatch: Record<string, unknown> = { isActive: true };
-  applyAssignedDateRange(assignmentMatch, query as Record<string, unknown>);
+  if (tab === 'called') {
+    const calledLeadIds = await resolveCalledLeadIdsInRange(query as Record<string, unknown>);
+    if (calledLeadIds) {
+      assignmentMatch.leadId = { $in: calledLeadIds };
+    }
+  } else {
+    applyLeadDateRange(assignmentMatch, query as Record<string, unknown>, 'assignedAt');
+  }
 
   const assignments = await LeadAssignment.find(assignmentMatch).populate<{
     leadId: ILead;
