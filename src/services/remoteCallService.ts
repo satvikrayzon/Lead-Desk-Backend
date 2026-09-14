@@ -228,10 +228,11 @@ export async function applyCallStatus(
     }
 
     // First time this remote call ends → count it on the lead (Windows CRM has no local call DB).
+    // Includes not-connected outcomes (busy / no_answer / rejected / failed).
     if (!TERMINAL.has(previousStatus)) {
       await Lead.findByIdAndUpdate(call.leadId, {
         $inc: { callCount: 1 },
-        $set: { lastCalledAt: call.endTime },
+        $set: { lastCalledAt: call.endTime, lastContactDate: call.endTime },
       });
       await LeadAssignment.updateMany(
         { leadId: call.leadId, isActive: true },

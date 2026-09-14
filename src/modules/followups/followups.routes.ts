@@ -213,13 +213,18 @@ export async function syncLeadLegacyFollowUpFields(leadId: string): Promise<void
   if (latest) $set.lastContactDate = latest.createdAt;
 
   const dialFollowUps = followUps.filter((f) => {
-    const o = (f.callOutcome || '').trim().toLowerCase();
-    return Boolean(f.clientCallId) || (o.length > 0 && o !== 'unknown');
+    const o = (f.callOutcome || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    // Count every dial attempt, including not-connected / busy / no-answer.
+    if (f.clientCallId || f.callRecordingId) return true;
+    if (!o || o === 'unknown') return false;
+    return true;
   });
   if (dialFollowUps.length > 0) {
     const latestDial = dialFollowUps[dialFollowUps.length - 1];
     $set.callCount = dialFollowUps.length;
     if (latestDial.createdAt) $set.lastCalledAt = latestDial.createdAt;
+    // Keep lastContactDate in sync for UI "last contacted" even when not connected.
+    if (latestDial.createdAt) $set.lastContactDate = latestDial.createdAt;
   }
 
   const withFill = followUps.filter(
