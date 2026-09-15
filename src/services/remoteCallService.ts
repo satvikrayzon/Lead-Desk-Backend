@@ -17,6 +17,9 @@ const TERMINAL: Set<RemoteCallStatus> = new Set([
 const activeCallByAgent = new Map<string, string>();
 const seenCallIds = new Set<string>();
 
+/** If a call stays non-terminal this long, treat the agent lock as stale. */
+const STALE_ACTIVE_CALL_MS = 3 * 60 * 1000;
+
 function normalizePhone(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
   const cleaned = raw.trim().replace(/[^\d+*#]/g, '');
@@ -25,6 +28,63 @@ function normalizePhone(raw: unknown): string | null {
 
 function isValidObjectId(id: string): boolean {
   return mongoose.Types.ObjectId.isValid(id);
+}
+
+/** Clear in-memory active-call lock for an agent (and optionally a specific call). */
+export function clearAgentActiveCall(agentId: string, callId?: string): void {
+  if (!agentId) return;
+  if (callId) {
+    if (activeCallByAgent.get(agentId) === callId) {
+      activeCallByAgent.delete(agentId);
+    }
+    return;
+  }
+  activeCallByAgent.delete(agentId);
+}
+
+/**
+ * If the agent still has a lock but the DB call is already terminal / missing / too old,
+ * drop the lock so the telecaller can dial again.
+ */
+async function releaseStaleAgentLock(agentId: string): Promise<boolean> {
+  const lockedCallId = activeCallByAgent.get(agentId);
+  if (!lockedCallId) return false;
+
+  const call = await RemoteCall.findOne({ callId: lockedCallId, agentId }).lean();
+  if (!call) {
+    activeCallByAgent.delete(agentId);
+    return true;
+  }
+
+  if (TERMINAL.has(call.status as RemoteCallStatus)) {
+    activeCallByAgent.delete(agentId);
+    return true;
+  }
+
+  const startedAt = call.startTime ? new Date(call.startTime).getTime() : 0;
+  const ageMs = Date.now() - startedAt;
+  const status = call.status as RemoteCallStatus;
+  const neverLeftQueue = status === 'pending' || status === 'initiated';
+  const staleSoon = neverLeftQueue && ageMs >= 45_000;
+  const staleHard = ageMs >= STALE_ACTIVE_CALL_MS;
+
+  if (staleSoon || staleHard) {
+    activeCallByAgent.delete(agentId);
+    // Mark the orphaned call ended so dashboards/history stay consistent.
+    await RemoteCall.updateOne(
+      { _id: call._id, status: { $nin: [...TERMINAL] } },
+      {
+        $set: {
+          status: 'failed',
+          endTime: new Date(),
+          lastError: 'Stale call lock cleared (no terminal status received).',
+        },
+      }
+    );
+    return true;
+  }
+
+  return false;
 }
 
 export type InitiateResult =
@@ -73,11 +133,14 @@ export async function initiateRemoteCall(
   }
 
   if (activeCallByAgent.has(input.agentId)) {
-    return {
-      ok: false,
-      code: 'CALL_IN_PROGRESS',
-      message: 'Another call is already in progress for this agent.',
-    };
+    const released = await releaseStaleAgentLock(input.agentId);
+    if (!released && activeCallByAgent.has(input.agentId)) {
+      return {
+        ok: false,
+        code: 'CALL_IN_PROGRESS',
+        message: 'Another call is already in progress for this agent.',
+      };
+    }
   }
 
   const callId = (input.callId && input.callId.trim()) || uuidv4();

@@ -119,6 +119,10 @@ class RemoteCallHttpHub {
             { agentId, deviceId },
             { $set: { online: false, lastSeen: new Date() }, $unset: { socketId: 1 } }
           );
+          // Drop in-memory call lock — Android can no longer finish the call.
+          void import('./remoteCallService').then(({ clearAgentActiveCall }) => {
+            clearAgentActiveCall(agentId);
+          });
         } else {
           this.windowsSubs.delete(agentId);
         }

@@ -94,7 +94,13 @@ class RemoteCallPresence {
       if (devices) {
         const current = devices.get(session.deviceId);
         if (current === socketId) devices.delete(session.deviceId);
-        if (devices.size === 0) this.androidByAgent.delete(session.agentId);
+        if (devices.size === 0) {
+          this.androidByAgent.delete(session.agentId);
+          // No Android left for this agent → clear stuck call lock.
+          void import('./remoteCallService').then(({ clearAgentActiveCall }) => {
+            clearAgentActiveCall(session.agentId);
+          });
+        }
       }
       void AgentDevice.updateOne(
         { agentId: session.agentId, deviceId: session.deviceId, socketId },
