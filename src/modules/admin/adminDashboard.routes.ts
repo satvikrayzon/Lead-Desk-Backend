@@ -8,6 +8,7 @@ import { createAuditLog, formatLead } from '../../utils/helpers';
 import { assignmentInsertFromLead, listFieldsFromAssignment } from '../../services/assignmentListSync';
 import { toApiRole } from '../../utils/roleMapping';
 import { dateKeyIst, daysAgoIst, startOfIstDay } from '../../utils/istCalendar';
+import { effectiveRecordingTalkSeconds } from '../../utils/audioDuration';
 import {
   buildAllDailySalesReports,
   buildDailySalesReport,
@@ -141,7 +142,7 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       return empty;
     }
 
-    const [assignmentStats, dialsRange, overdueFollowUps, dueTodayFollowUps, followUpsRange, pendingKeys] =
+    const [assignmentStats, companyDials, overdueFollowUps, dueTodayFollowUps, followUpsRange, pendingKeys] =
       await Promise.all([
       loadAssignmentStatsByAgent(activeAgentIds as Types.ObjectId[], tomorrowStart),
       loadCompanyDials(rangeStart, rangeEndExclusive, activeAgentIds),
@@ -170,6 +171,8 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       loadPendingAssignmentKeys({ isActive: true, agentId: { $in: activeAgentIds } }, tomorrowStart, 40),
     ]);
 
+    const dialsRange = companyDials.dials;
+    const talkByAgentRange = companyDials.talkByAgent;
     const pendingLeadsPreview = await hydratePendingLeads(pendingKeys);
 
     const overdueLeadIds = new Set(overdueFollowUps.map((f) => refId(f.leadId)).filter(Boolean));
@@ -198,14 +201,25 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     let talkSecondsToday = 0;
     for (const c of dialsToday) {
       const aid = c.agentId;
-      const secs = Math.max(0, c.durationSeconds || 0);
       callsTodayByAgent.set(aid, (callsTodayByAgent.get(aid) ?? 0) + 1);
+    }
+    // Talk today from recordings (not dial join) — matches uploaded audio length.
+    const todayRecordings = await CallRecording.find({
+      agentId: { $in: activeAgentIds },
+      callStartTime: { $gte: todayStart, $lt: tomorrowStart },
+    })
+      .select('agentId durationSeconds s3Key s3Bucket')
+      .lean();
+    for (const r of todayRecordings) {
+      const aid = r.agentId?.toString() || '';
+      if (!aid) continue;
+      const secs = effectiveRecordingTalkSeconds(r);
       talkTodayByAgent.set(aid, (talkTodayByAgent.get(aid) ?? 0) + secs);
       talkSecondsToday += secs;
     }
 
     const callsRangeByAgent = new Map<string, number>();
-    const talkRangeByAgent = new Map<string, number>();
+    const talkRangeByAgent = new Map<string, number>(talkByAgentRange);
     const followUpsRangeByAgent = new Map<string, number>();
     const dayBuckets: Record<string, { count: number; talk_seconds: number }> = {};
 
@@ -221,20 +235,18 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     }
 
     let talkSecondsRange = 0;
+    for (const secs of talkRangeByAgent.values()) talkSecondsRange += secs;
+
     const outcomeCounts = new Map<string, number>();
     let connectedCalls = 0;
     let recordingsUploaded = 0;
 
     for (const c of dialsRange) {
       const aid = c.agentId;
-      const secs = Math.max(0, c.durationSeconds || 0);
       callsRangeByAgent.set(aid, (callsRangeByAgent.get(aid) ?? 0) + 1);
-      talkRangeByAgent.set(aid, (talkRangeByAgent.get(aid) ?? 0) + secs);
-      talkSecondsRange += secs;
       const key = dateKey(new Date(c.startTime));
       if (key in dayBuckets) {
         dayBuckets[key].count += 1;
-        dayBuckets[key].talk_seconds += secs;
       }
 
       const outcome = normalizeOutcome(c.callOutcome);
@@ -242,7 +254,21 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
 
       if (outcome === 'received' || outcome === 'decisionMakerConnected') {
         connectedCalls += 1;
-        if (secs > 0) recordingsUploaded += 1; // talk-linked connected dials
+        if (c.durationSeconds > 0) recordingsUploaded += 1;
+      }
+    }
+
+    // Attribute talk to day buckets from recordings in range.
+    const rangeRecordings = await CallRecording.find({
+      agentId: { $in: activeAgentIds },
+      callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
+    })
+      .select('callStartTime durationSeconds s3Key s3Bucket')
+      .lean();
+    for (const r of rangeRecordings) {
+      const key = dateKey(new Date(r.callStartTime));
+      if (key in dayBuckets) {
+        dayBuckets[key].talk_seconds += effectiveRecordingTalkSeconds(r);
       }
     }
 
@@ -479,7 +505,7 @@ adminDashboardRouter.get(
 
       let talkSeconds = 0;
       const rows = calls.map((c) => {
-        const secs = Math.max(0, c.durationSeconds || 0);
+        const secs = effectiveRecordingTalkSeconds(c);
         talkSeconds += secs;
         const lead = c.leadId as unknown as {
           _id?: { toString(): string };

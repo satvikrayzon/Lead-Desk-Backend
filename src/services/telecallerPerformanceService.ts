@@ -1,5 +1,6 @@
 import { Types } from 'mongoose';
 import { CallRecording, Lead, LeadFollowUp, RemoteCall, User } from '../models';
+import { effectiveRecordingTalkSeconds } from '../utils/audioDuration';
 import { dateKeyIst, daysAgoIst, startOfIstDay } from '../utils/istCalendar';
 import { loadAssignmentStatsByAgent } from './assignmentLeadLite';
 import {
@@ -318,7 +319,7 @@ async function buildTelecallerPerformanceDashboardUncached(userId: string) {
   const [statsByAgent, talkRecordingsWeek, remotesWeek, followUpsWeekDocs] = await Promise.all([
     loadAssignmentStatsByAgent([agentOid], tomorrowStart),
     CallRecording.find({ agentId: userId, callStartTime: { $gte: weekStart } })
-      .select('durationSeconds clientCallId callStartTime')
+      .select('durationSeconds clientCallId callStartTime s3Key s3Bucket')
       .lean(),
     RemoteCall.find({
       agentId: userId,
@@ -341,15 +342,30 @@ async function buildTelecallerPerformanceDashboardUncached(userId: string) {
 
   const talkByClientToday = new Map<string, number>();
   const talkByClientWeek = new Map<string, number>();
+  let talkSecondsTodayFromRecordings = 0;
+  let talkSecondsWeekFromRecordings = 0;
+  const recordingTalkByDay: Record<string, number> = {};
+
   for (const r of talkRecordingsWeek) {
-    const secs = Math.max(0, r.durationSeconds || 0);
-    if (!r.clientCallId) continue;
-    talkByClientWeek.set(r.clientCallId, Math.max(talkByClientWeek.get(r.clientCallId) ?? 0, secs));
+    const secs = effectiveRecordingTalkSeconds(r);
+    talkSecondsWeekFromRecordings += secs;
+    const day = dateKeyIst(r.callStartTime);
+    recordingTalkByDay[day] = (recordingTalkByDay[day] ?? 0) + secs;
+
     if (r.callStartTime >= todayStart) {
-      talkByClientToday.set(
+      talkSecondsTodayFromRecordings += secs;
+    }
+    if (r.clientCallId) {
+      talkByClientWeek.set(
         r.clientCallId,
-        Math.max(talkByClientToday.get(r.clientCallId) ?? 0, secs)
+        Math.max(talkByClientWeek.get(r.clientCallId) ?? 0, secs)
       );
+      if (r.callStartTime >= todayStart) {
+        talkByClientToday.set(
+          r.clientCallId,
+          Math.max(talkByClientToday.get(r.clientCallId) ?? 0, secs)
+        );
+      }
     }
   }
 
@@ -391,14 +407,13 @@ async function buildTelecallerPerformanceDashboardUncached(userId: string) {
   for (let i = 6; i >= 0; i--) {
     dayBuckets[dateKeyIst(daysAgoIst(i))] = { count: 0, talk_seconds: 0 };
   }
-  let talkSecondsWeek = 0;
+  // Attempt counts from dials; talk time from recordings (authoritative).
   for (const c of dialsWeek) {
-    talkSecondsWeek += c.durationSeconds;
     const key = dateKeyIst(c.startTime);
-    if (key in dayBuckets) {
-      dayBuckets[key].count += 1;
-      dayBuckets[key].talk_seconds += c.durationSeconds;
-    }
+    if (key in dayBuckets) dayBuckets[key].count += 1;
+  }
+  for (const [day, secs] of Object.entries(recordingTalkByDay)) {
+    if (day in dayBuckets) dayBuckets[day].talk_seconds = secs;
   }
 
   const fillToday = avgFormFill(followUpsTodayDocs);
@@ -441,8 +456,8 @@ async function buildTelecallerPerformanceDashboardUncached(userId: string) {
       calls_last_7_days: dialsWeek.length,
       // All-time exact count was a full collection scan — use 7-day as the KPI base.
       calls_all_time: dialsWeek.length,
-      talk_seconds_today: todayCalling.talkSeconds,
-      talk_seconds_last_7_days: talkSecondsWeek,
+      talk_seconds_today: talkSecondsTodayFromRecordings,
+      talk_seconds_last_7_days: talkSecondsWeekFromRecordings,
       follow_ups_today: followUpsTodayDocs.length,
       follow_ups_last_7_days: followUpsWeekDocs.length,
       next_follow_ups_today: todaySales.nextFollowUps,
@@ -474,6 +489,12 @@ export type CompanyDialRow = {
   source: 'follow_up' | 'remote';
 };
 
+export type CompanyDialsResult = {
+  dials: CompanyDialRow[];
+  /** Sum of CallRecording talk seconds per agent (authoritative for Talk today). */
+  talkByAgent: Map<string, number>;
+};
+
 function outcomeFromRemoteStatus(status: string): string {
   switch (status) {
     case 'ended':
@@ -500,7 +521,7 @@ export async function loadCompanyDials(
   rangeStart: Date,
   rangeEndExclusive: Date,
   activeIds?: Array<{ toString(): string }>
-): Promise<CompanyDialRow[]> {
+): Promise<CompanyDialsResult> {
   let ids = activeIds;
   if (!ids) {
     const activeAgents = await User.find({
@@ -511,7 +532,7 @@ export async function loadCompanyDials(
       .lean();
     ids = activeAgents.map((u) => u._id);
   }
-  if (!ids || ids.length === 0) return [];
+  if (!ids || ids.length === 0) return { dials: [], talkByAgent: new Map() };
 
   const [followUps, remotes, talkRecordings] = await Promise.all([
     LeadFollowUp.find({
@@ -531,14 +552,18 @@ export async function loadCompanyDials(
       agentId: { $in: ids },
       callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
     })
-      .select('clientCallId durationSeconds')
+      .select('agentId clientCallId durationSeconds s3Key s3Bucket callStartTime')
       .lean(),
   ]);
 
   const talkByClient = new Map<string, number>();
+  /** Authoritative talk totals (all recordings, not only clientCallId-linked). */
+  const talkByAgent = new Map<string, number>();
   for (const r of talkRecordings) {
+    const secs = effectiveRecordingTalkSeconds(r);
+    const aid = r.agentId?.toString() || '';
+    if (aid) talkByAgent.set(aid, (talkByAgent.get(aid) ?? 0) + secs);
     if (!r.clientCallId) continue;
-    const secs = Math.max(0, r.durationSeconds || 0);
     talkByClient.set(r.clientCallId, Math.max(talkByClient.get(r.clientCallId) ?? 0, secs));
   }
 
@@ -586,17 +611,19 @@ export async function loadCompanyDials(
     const startMs = new Date(c.startTime).getTime();
     if (leadId && near(agentId, leadId, startMs)) continue;
 
+    // Prefer recording duration when remote callId matches clientCallId.
+    const fromRec = c.callId ? talkByClient.get(c.callId) : undefined;
     rows.push({
       agentId,
       startTime: c.startTime,
-      durationSeconds: Math.max(0, c.durationSeconds || 0),
+      durationSeconds: Math.max(0, fromRec ?? (c.durationSeconds || 0)),
       callOutcome: outcomeFromRemoteStatus(c.status),
       source: 'remote',
     });
     mark(agentId, leadId, startMs, c.callId);
   }
 
-  return rows;
+  return { dials: rows, talkByAgent };
 }
 
 /**

@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
 import { Types } from 'mongoose';
 import { CallRecording, Lead, LeadAssignment, LeadFollowUp, RemoteCall, User } from '../models';
+import { effectiveRecordingTalkSeconds } from '../utils/audioDuration';
 import { withAdminDashCache } from './dashboardCache';
 
 export type DailySalesReport = {
@@ -350,7 +351,7 @@ async function computeDailySalesReport(
         agentId,
         callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
       })
-        .select('durationSeconds clientCallId')
+        .select('durationSeconds clientCallId s3Key s3Bucket')
         .lean(),
       RemoteCall.distinct('leadId', {
         agentId,
@@ -362,18 +363,9 @@ async function computeDailySalesReport(
   const priorCalled = new Set(priorCalledLeadIds.map((id) => id.toString()));
   for (const id of priorRemotes) priorCalled.add(id.toString());
 
-  const talkByClientCallId = new Map<string, number>();
-  let orphanRecordingTalk = 0;
+  let talkSecondsFromRecordings = 0;
   for (const r of talkRecordings) {
-    const secs = Math.max(0, r.durationSeconds || 0);
-    if (r.clientCallId) {
-      talkByClientCallId.set(
-        r.clientCallId,
-        Math.max(talkByClientCallId.get(r.clientCallId) ?? 0, secs)
-      );
-    } else {
-      orphanRecordingTalk += secs;
-    }
+    talkSecondsFromRecordings += effectiveRecordingTalkSeconds(r);
   }
 
   const bucket = emptyCallBuckets();
@@ -411,9 +403,8 @@ async function computeDailySalesReport(
     const startMs = f.createdAt ? new Date(f.createdAt).getTime() : Date.now();
     const clientId = f.clientCallId?.trim() || '';
     const kind = resolveKind(leadKey, Math.max(1, f.sequenceNumber ?? 1));
-    const talk =
-      (clientId ? talkByClientCallId.get(clientId) : undefined) ?? 0;
-    classifyDial(bucket, f.callOutcome || 'unknown', talk, kind);
+    // Outcome counts only — talk seconds come from recordings below.
+    classifyDial(bucket, f.callOutcome || 'unknown', 0, kind);
     markDial(leadKey, startMs, clientId || null);
     followUpDialsAdded += 1;
   }
@@ -428,16 +419,13 @@ async function computeDailySalesReport(
     if (leadKey && alreadyDialedNear(leadKey, startMs)) continue;
 
     const kind = resolveKind(leadKey);
-    const talk = Math.max(0, c.durationSeconds || 0);
-    classifyDial(bucket, outcomeFromRemoteStatus(c.status), talk, kind);
+    classifyDial(bucket, outcomeFromRemoteStatus(c.status), 0, kind);
     markDial(leadKey, startMs, callId);
     remoteAdded += 1;
   }
 
-  // Recordings never add dials — only optional talk already applied above via clientCallId.
-  if (orphanRecordingTalk > 0 && bucket.attempted > 0) {
-    bucket.talkSeconds += orphanRecordingTalk;
-  }
+  // Authoritative talk = sum of all recording durations (matches player audio length).
+  bucket.talkSeconds = talkSecondsFromRecordings;
 
   let interested = 0;
   let notInterested = 0;
