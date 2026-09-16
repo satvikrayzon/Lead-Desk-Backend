@@ -227,6 +227,8 @@ export async function applyCallStatus(
     status: string;
     timestamp?: string;
     error?: string;
+    /** Authoritative talk seconds from Android CallLog DURATION when available. */
+    durationSeconds?: number;
   }
 ): Promise<{ ok: boolean; message?: string }> {
   if (!input.callId || !REMOTE_CALL_STATUSES.includes(input.status as RemoteCallStatus)) {
@@ -249,16 +251,40 @@ export async function applyCallStatus(
     error: call.lastError ?? null,
   });
 
-  if (TERMINAL.has(call.status) && status !== call.status) {
-    // Allow refining generic "ended" into a specific outcome from CallLog.
+  const clientDuration =
+    typeof input.durationSeconds === 'number' &&
+    Number.isFinite(input.durationSeconds) &&
+    input.durationSeconds >= 0
+      ? Math.floor(input.durationSeconds)
+      : undefined;
+
+  const neverConnectedStatus = (s: string) =>
+    s === 'busy' || s === 'rejected' || s === 'failed' || s === 'no_answer';
+
+  // Already terminal: patch late CallLog talk time and/or refine ended → busy/etc.
+  if (TERMINAL.has(call.status)) {
     const canRefine =
-      call.status === 'ended' &&
-      status !== 'ended' &&
-      TERMINAL.has(status);
+      call.status === 'ended' && status !== 'ended' && TERMINAL.has(status);
+
+    if (status === call.status || (status === 'ended' && call.status === 'ended')) {
+      if (clientDuration !== undefined && !neverConnectedStatus(call.status)) {
+        // CallLog DURATION is authoritative over end−answer estimates.
+        call.durationSeconds = clientDuration;
+        if (clientDuration > 0 && !call.answerTime) {
+          const end = call.endTime || new Date();
+          call.answerTime = new Date(end.getTime() - clientDuration * 1000);
+        }
+        await call.save();
+      }
+      forwardStatus(io, input.agentId, payloadBase());
+      return { ok: true };
+    }
+
     if (!canRefine) {
       forwardStatus(io, input.agentId, payloadBase());
       return { ok: true };
     }
+    // Fall through to refine outcome (e.g. ended → no_answer).
   }
 
   const now = input.timestamp ? new Date(input.timestamp) : new Date();
@@ -270,7 +296,7 @@ export async function applyCallStatus(
     call.answerTime = now;
   }
 
-  const neverConnected = status === 'busy' || status === 'rejected' || status === 'failed' || status === 'no_answer';
+  const neverConnected = neverConnectedStatus(status);
   if (neverConnected) {
     call.answerTime = undefined;
     call.durationSeconds = 0;
@@ -278,14 +304,21 @@ export async function applyCallStatus(
 
   if (TERMINAL.has(status)) {
     call.endTime = now;
-    if (call.answerTime && !neverConnected) {
+    if (neverConnected) {
+      call.durationSeconds = 0;
+    } else if (clientDuration !== undefined) {
+      // Prefer Android CallLog DURATION over end−answer wall clock.
+      call.durationSeconds = clientDuration;
+      if (clientDuration > 0 && !call.answerTime) {
+        call.answerTime = new Date(now.getTime() - clientDuration * 1000);
+      }
+    } else if (call.answerTime) {
       call.durationSeconds = Math.max(
         0,
         Math.floor((call.endTime.getTime() - call.answerTime.getTime()) / 1000)
       );
-    } else if (neverConnected) {
-      call.durationSeconds = 0;
     }
+    // else: ended without answerTime and no CallLog duration → leave prior value (usually 0)
     if (activeCallByAgent.get(input.agentId) === call.callId) {
       activeCallByAgent.delete(input.agentId);
     }

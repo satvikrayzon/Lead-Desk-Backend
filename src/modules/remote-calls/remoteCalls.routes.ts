@@ -29,6 +29,7 @@ const statusSchema = z.object({
   status: z.string().min(1),
   timestamp: z.string().optional(),
   error: z.string().optional(),
+  duration_seconds: z.number().int().min(0).optional(),
 });
 
 const endSchema = z.object({
@@ -133,6 +134,7 @@ remoteCallsRouter.post('/status', async (req: AuthRequest, res: Response, next: 
       status: parsed.data.status,
       timestamp: parsed.data.timestamp,
       error: parsed.data.error,
+      durationSeconds: parsed.data.duration_seconds,
     });
 
     res.json(result);

@@ -179,12 +179,19 @@ export function createSocketServer(httpServer: http.Server): Server {
         return;
       }
 
+      const rawDuration = payload?.durationSeconds ?? payload?.duration_seconds;
+      const parsedDuration =
+        rawDuration === undefined || rawDuration === null || rawDuration === ''
+          ? undefined
+          : Number(rawDuration);
+
       const result = await applyCallStatus(io, {
         agentId: user.userId,
         callId: String(payload?.callId || ''),
         status: String(payload?.status || ''),
         timestamp: payload?.timestamp ? String(payload.timestamp) : undefined,
         error: payload?.error ? String(payload.error) : undefined,
+        durationSeconds: Number.isFinite(parsedDuration) ? parsedDuration : undefined,
       });
       ack?.(result);
     });

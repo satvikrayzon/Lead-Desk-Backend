@@ -63,11 +63,27 @@ recordingsRouter.post(
         throw new AppError(400, 'Invalid date format for call times.');
       }
 
-      if (isNaN(durationSeconds) || durationSeconds < 1) {
-        durationSeconds = Math.max(
-          1,
-          Math.round((callEndTime.getTime() - callStartTime.getTime()) / 1000)
-        );
+      // Prefer client talk seconds (CallLog DURATION). Do NOT replace an explicit
+      // small/zero value with OFFHOOK wall-clock — that inflated report talk time.
+      if (isNaN(durationSeconds) || durationSeconds < 0) {
+        durationSeconds = 0;
+      }
+      // Multipart schema historically required a positive integer; keep min 1 only
+      // when the client omitted a usable value entirely (NaN path above → 0).
+      if (durationSeconds < 1) {
+        const outcome = String(call_outcome || '').toLowerCase();
+        const connectedOutcome =
+          outcome === 'received' ||
+          outcome === 'answered' ||
+          outcome === 'decision_maker_connected' ||
+          outcome === 'decisionmakerconnected';
+        if (connectedOutcome) {
+          // Connected but talk unknown — store 1 rather than ring+talk wall time.
+          durationSeconds = 1;
+        } else {
+          durationSeconds = Math.max(durationSeconds, 0);
+          if (durationSeconds < 1) durationSeconds = 1;
+        }
       }
 
       const lead = await Lead.findById(lead_id);
