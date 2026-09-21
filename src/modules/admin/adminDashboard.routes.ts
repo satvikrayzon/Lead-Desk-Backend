@@ -28,6 +28,7 @@ import {
   loadAssignmentStatsByAgent,
   loadPendingAssignmentKeys,
 } from '../../services/assignmentLeadLite';
+import { buildAdminDashboardWorkbook } from '../../services/adminDashboardExport';
 
 export const adminDashboardRouter = Router();
 
@@ -81,22 +82,59 @@ function refId(ref: unknown): string {
 /** Company-wide dashboard: summary + insights + per-telecaller report. */
 adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const todayStart = startOfDay();
-    const tomorrowStart = endOfDayExclusive(todayStart);
+    const { days, rangeStart, rangeEndExclusive } = parseAdminDashboardRange(req.query);
+    const data = await loadAdminDashboardPayload(days, rangeStart, rangeEndExclusive);
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+});
 
-    // Range for chart / outcomes / leaderboard / coverage (default last 7 days).
-    const daysRaw = Number(req.query.days ?? 7);
-    const days = [1, 7, 14, 30].includes(daysRaw) ? daysRaw : 7;
-    const fromQuery = parseDayStart(req.query.from);
-    const toQuery = parseDayStart(req.query.to);
-    const rangeStart = fromQuery ?? daysAgo(days - 1);
-    const rangeEndExclusive = toQuery ? endOfDayExclusive(toQuery) : endOfDayExclusive(todayStart);
-    if (rangeEndExclusive <= rangeStart) {
-      throw new AppError(400, 'Invalid date range.');
-    }
+/** Excel export of the company dashboard (all telecallers + comparison sheets). */
+adminDashboardRouter.get('/export', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { days, rangeStart, rangeEndExclusive } = parseAdminDashboardRange(req.query);
+    const data = await loadAdminDashboardPayload(days, rangeStart, rangeEndExclusive);
+    const buffer = await buildAdminDashboardWorkbook(data as Parameters<typeof buildAdminDashboardWorkbook>[0]);
+    const from = (data as { range?: { from?: string } }).range?.from?.replace(/-/g, '') ?? 'from';
+    const to = (data as { range?: { to?: string } }).range?.to?.replace(/-/g, '') ?? 'to';
+    res.setHeader(
+      'Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="Dashboard_Report_${from}_${to}.xlsx"`
+    );
+    res.send(buffer);
+  } catch (err) {
+    next(err);
+  }
+});
 
-    const cacheKey = `${days}|${rangeStart.toISOString()}|${rangeEndExclusive.toISOString()}`;
-    const data = await withAdminDashCache(cacheKey, async () => {
+function parseAdminDashboardRange(query: AuthRequest['query']): {
+  days: number;
+  rangeStart: Date;
+  rangeEndExclusive: Date;
+} {
+  const todayStart = startOfDay();
+  const daysRaw = Number(query.days ?? 7);
+  const days = [1, 7, 14, 30].includes(daysRaw) ? daysRaw : 7;
+  const fromQuery = parseDayStart(query.from);
+  const toQuery = parseDayStart(query.to);
+  const rangeStart = fromQuery ?? daysAgo(days - 1);
+  const rangeEndExclusive = toQuery ? endOfDayExclusive(toQuery) : endOfDayExclusive(todayStart);
+  if (rangeEndExclusive <= rangeStart) {
+    throw new AppError(400, 'Invalid date range.');
+  }
+  return { days, rangeStart, rangeEndExclusive };
+}
+
+async function loadAdminDashboardPayload(days: number, rangeStart: Date, rangeEndExclusive: Date) {
+  const todayStart = startOfDay();
+  const tomorrowStart = endOfDayExclusive(todayStart);
+  const cacheKey = `${days}|${rangeStart.toISOString()}|${rangeEndExclusive.toISOString()}`;
+  return withAdminDashCache(cacheKey, async () => {
     const agents = await User.find({
       role: { $in: ['agent', 'manager'] },
       isActive: true,
@@ -198,10 +236,15 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
 
     const callsTodayByAgent = new Map<string, number>();
     const talkTodayByAgent = new Map<string, number>();
+    const rawLeadsTodayByAgent = new Map<string, number>();
+    const rawLeadsRangeByAgent = new Map<string, number>();
     let talkSecondsToday = 0;
     for (const c of dialsToday) {
       const aid = c.agentId;
       callsTodayByAgent.set(aid, (callsTodayByAgent.get(aid) ?? 0) + 1);
+      if (c.source !== 'follow_up') {
+        rawLeadsTodayByAgent.set(aid, (rawLeadsTodayByAgent.get(aid) ?? 0) + 1);
+      }
     }
     // Talk today from recordings (not dial join) — matches uploaded audio length.
     const todayRecordings = await CallRecording.find({
@@ -244,6 +287,9 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
     for (const c of dialsRange) {
       const aid = c.agentId;
       callsRangeByAgent.set(aid, (callsRangeByAgent.get(aid) ?? 0) + 1);
+      if (c.source !== 'follow_up') {
+        rawLeadsRangeByAgent.set(aid, (rawLeadsRangeByAgent.get(aid) ?? 0) + 1);
+      }
       const key = dateKey(new Date(c.startTime));
       if (key in dayBuckets) {
         dayBuckets[key].count += 1;
@@ -318,6 +364,8 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
         pending_leads: pendingByAgent.get(id) ?? 0,
         calls_today: callsTodayByAgent.get(id) ?? 0,
         calls_last_7_days: callsRangeByAgent.get(id) ?? 0,
+        calls_from_raw_leads_today: rawLeadsTodayByAgent.get(id) ?? 0,
+        calls_from_raw_leads_in_range: rawLeadsRangeByAgent.get(id) ?? 0,
         talk_seconds_today: talkTodayByAgent.get(id) ?? 0,
         talk_seconds_last_7_days: talkRangeByAgent.get(id) ?? 0,
         avg_form_fill_seconds_today: fillToday.avgBy.get(id) ?? 0,
@@ -453,12 +501,8 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
       pending_leads: pendingLeadsPreview,
     };
     return payload;
-    });
-    res.json({ data });
-  } catch (err) {
-    next(err);
-  }
-});
+  });
+}
 
 /** Same My Performance dashboard payload for one telecaller (admin view). */
 adminDashboardRouter.get(

@@ -713,10 +713,18 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
     { header: 'Rate Provided', key: 'rate', width: 12 },
     { header: 'Closed/Order', key: 'closed', width: 12 },
     { header: 'Estimated Sales Value', key: 'value', width: 18 },
+    { header: 'Talk Time', key: 'talk', width: 12 },
+    { header: 'Talk Seconds', key: 'talkSec', width: 12 },
     { header: 'Next Follow-ups', key: 'nextFu', width: 14 },
   ];
 
   for (const r of reports) {
+    const talkSec = r.talk_seconds ?? 0;
+    const h = Math.floor(talkSec / 3600);
+    const m = Math.floor((talkSec % 3600) / 60);
+    const sec = talkSec % 60;
+    const talkLabel =
+      h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${String(sec).padStart(2, '0')}s` : `${sec}s`;
     summary.addRow({
       from: r.date_from,
       to: r.date_to,
@@ -739,6 +747,8 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
       rate: r.lead_sales.rate_provided,
       closed: r.lead_sales.closed_order_received,
       value: r.lead_sales.estimated_sales_value,
+      talk: talkLabel,
+      talkSec,
       nextFu: r.next_follow_up.total_follow_up_calls,
     });
   }

@@ -7,7 +7,7 @@ import {
   formatDailySalesReportText,
   parseReportRange,
 } from '../../services/dailySalesReportService';
-import { buildTelecallerPerformanceDashboard, listAgentCallHistory } from '../../services/telecallerPerformanceService';
+import { buildTelecallerPerformanceDashboard, listAgentCallHistory, buildPeerBenchmarks } from '../../services/telecallerPerformanceService';
 
 export const meDashboardRouter = Router();
 
@@ -48,6 +48,21 @@ meDashboardRouter.get('/dashboard', async (req: AuthRequest, res: Response, next
       err: err instanceof Error ? err.message : err,
       ms: Date.now() - startedAt,
     });
+    if (err instanceof Error && err.message === 'Telecaller not found') {
+      return next(new AppError(404, err.message));
+    }
+    next(err);
+  }
+});
+
+/** Anonymized peer benchmarks (own vs team/company avg — no other names). */
+meDashboardRouter.get('/dashboard/peer-benchmarks', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) throw new AppError(401, 'Authentication required.');
+    const data = await buildPeerBenchmarks(userId);
+    res.json({ data });
+  } catch (err) {
     if (err instanceof Error && err.message === 'Telecaller not found') {
       return next(new AppError(404, err.message));
     }

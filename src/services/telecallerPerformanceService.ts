@@ -714,3 +714,172 @@ export async function listAgentCallHistory(userId: string, limit = 150) {
     };
   });
 }
+
+type PeerMetricBucket = {
+  talk_seconds_today: number;
+  talk_seconds_last_7_days: number;
+  calls_today: number;
+  calls_last_7_days: number;
+  calls_from_raw_leads_today: number;
+  calls_from_raw_leads_last_7_days: number;
+};
+
+function emptyPeerBucket(): PeerMetricBucket {
+  return {
+    talk_seconds_today: 0,
+    talk_seconds_last_7_days: 0,
+    calls_today: 0,
+    calls_last_7_days: 0,
+    calls_from_raw_leads_today: 0,
+    calls_from_raw_leads_last_7_days: 0,
+  };
+}
+
+function avgPeerBucket(rows: PeerMetricBucket[]): PeerMetricBucket {
+  if (rows.length === 0) return emptyPeerBucket();
+  const n = rows.length;
+  const sum = rows.reduce(
+    (acc, r) => ({
+      talk_seconds_today: acc.talk_seconds_today + r.talk_seconds_today,
+      talk_seconds_last_7_days: acc.talk_seconds_last_7_days + r.talk_seconds_last_7_days,
+      calls_today: acc.calls_today + r.calls_today,
+      calls_last_7_days: acc.calls_last_7_days + r.calls_last_7_days,
+      calls_from_raw_leads_today: acc.calls_from_raw_leads_today + r.calls_from_raw_leads_today,
+      calls_from_raw_leads_last_7_days:
+        acc.calls_from_raw_leads_last_7_days + r.calls_from_raw_leads_last_7_days,
+    }),
+    emptyPeerBucket()
+  );
+  return {
+    talk_seconds_today: Math.round(sum.talk_seconds_today / n),
+    talk_seconds_last_7_days: Math.round(sum.talk_seconds_last_7_days / n),
+    calls_today: Math.round(sum.calls_today / n),
+    calls_last_7_days: Math.round(sum.calls_last_7_days / n),
+    calls_from_raw_leads_today: Math.round(sum.calls_from_raw_leads_today / n),
+    calls_from_raw_leads_last_7_days: Math.round(sum.calls_from_raw_leads_last_7_days / n),
+  };
+}
+
+/**
+ * Anonymized peer benchmarks for a telecaller — own metrics + team/company averages
+ * and ranks. Never returns other agents' names or ids.
+ */
+export async function buildPeerBenchmarks(userId: string) {
+  const me = await User.findById(userId).select('teamName isActive role').lean();
+  if (!me || !me.isActive) {
+    throw new Error('Telecaller not found');
+  }
+
+  const todayStart = startOfIstDay();
+  const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+  const rangeStart = daysAgoIst(6);
+
+  const agents = await User.find({
+    role: { $in: ['agent', 'manager'] },
+    isActive: true,
+  })
+    .select('_id teamName')
+    .lean();
+
+  const activeIds = agents.map((a) => a._id);
+  if (activeIds.length === 0) {
+    return {
+      own: emptyPeerBucket(),
+      team_avg: emptyPeerBucket(),
+      company_avg: emptyPeerBucket(),
+      rank: { by_talk_today: 1, by_calls_today: 1, by_raw_leads_today: 1, telecaller_count: 0 },
+    };
+  }
+
+  const [dials7, talkTodayRows] = await Promise.all([
+    loadCompanyDials(rangeStart, tomorrowStart, activeIds),
+    CallRecording.find({
+      agentId: { $in: activeIds },
+      callStartTime: { $gte: todayStart, $lt: tomorrowStart },
+    })
+      .select('agentId durationSeconds s3Key s3Bucket')
+      .lean(),
+  ]);
+
+  const callsTodayBy = new Map<string, number>();
+  const calls7By = new Map<string, number>();
+  const rawTodayBy = new Map<string, number>();
+  const raw7By = new Map<string, number>();
+  for (const d of dials7.dials) {
+    const aid = d.agentId;
+    calls7By.set(aid, (calls7By.get(aid) ?? 0) + 1);
+    if (d.source !== 'follow_up') {
+      raw7By.set(aid, (raw7By.get(aid) ?? 0) + 1);
+    }
+    if (d.startTime >= todayStart && d.startTime < tomorrowStart) {
+      callsTodayBy.set(aid, (callsTodayBy.get(aid) ?? 0) + 1);
+      if (d.source !== 'follow_up') {
+        rawTodayBy.set(aid, (rawTodayBy.get(aid) ?? 0) + 1);
+      }
+    }
+  }
+
+  const talkTodayBy = new Map<string, number>();
+  for (const r of talkTodayRows) {
+    const aid = r.agentId?.toString() || '';
+    if (!aid) continue;
+    talkTodayBy.set(aid, (talkTodayBy.get(aid) ?? 0) + effectiveRecordingTalkSeconds(r));
+  }
+
+  const byAgent = new Map<string, PeerMetricBucket & { teamName: string | null }>();
+  for (const a of agents) {
+    const id = a._id.toString();
+    byAgent.set(id, {
+      talk_seconds_today: talkTodayBy.get(id) ?? 0,
+      talk_seconds_last_7_days: dials7.talkByAgent.get(id) ?? 0,
+      calls_today: callsTodayBy.get(id) ?? 0,
+      calls_last_7_days: calls7By.get(id) ?? 0,
+      calls_from_raw_leads_today: rawTodayBy.get(id) ?? 0,
+      calls_from_raw_leads_last_7_days: raw7By.get(id) ?? 0,
+      teamName: a.teamName ?? null,
+    });
+  }
+
+  const ownRow = byAgent.get(userId) ?? { ...emptyPeerBucket(), teamName: me.teamName ?? null };
+  const own: PeerMetricBucket = {
+    talk_seconds_today: ownRow.talk_seconds_today,
+    talk_seconds_last_7_days: ownRow.talk_seconds_last_7_days,
+    calls_today: ownRow.calls_today,
+    calls_last_7_days: ownRow.calls_last_7_days,
+    calls_from_raw_leads_today: ownRow.calls_from_raw_leads_today,
+    calls_from_raw_leads_last_7_days: ownRow.calls_from_raw_leads_last_7_days,
+  };
+
+  const allRows = [...byAgent.values()];
+  const company_avg = avgPeerBucket(allRows);
+  const teamName = me.teamName?.trim() || null;
+  const teamRows = teamName
+    ? allRows.filter((r) => (r.teamName ?? '').trim() === teamName)
+    : allRows;
+  const team_avg = avgPeerBucket(teamRows.length > 0 ? teamRows : allRows);
+
+  const talkRankList = [...byAgent.entries()].sort(
+    (a, b) => b[1].talk_seconds_today - a[1].talk_seconds_today
+  );
+  const callsRankList = [...byAgent.entries()].sort(
+    (a, b) => b[1].calls_today - a[1].calls_today
+  );
+  const rawRankList = [...byAgent.entries()].sort(
+    (a, b) => b[1].calls_from_raw_leads_today - a[1].calls_from_raw_leads_today
+  );
+  const by_talk_today = Math.max(1, talkRankList.findIndex(([id]) => id === userId) + 1);
+  const by_calls_today = Math.max(1, callsRankList.findIndex(([id]) => id === userId) + 1);
+  const by_raw_leads_today = Math.max(1, rawRankList.findIndex(([id]) => id === userId) + 1);
+
+  return {
+    own,
+    team_avg,
+    company_avg,
+    rank: {
+      by_talk_today,
+      by_calls_today,
+      by_raw_leads_today,
+      telecaller_count: agents.length,
+    },
+  };
+}
