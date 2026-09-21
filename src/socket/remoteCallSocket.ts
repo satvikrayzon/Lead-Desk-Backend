@@ -39,7 +39,10 @@ async function authenticateSocket(socket: Socket): Promise<AuthedSocketData | nu
       sub: string;
       role: string;
       email: string;
+      typ?: string;
     };
+    // Reject refresh tokens on the socket — only access JWTs are allowed.
+    if (decoded.typ && decoded.typ !== 'access') return null;
     const user = await User.findById(decoded.sub).select('name email role isActive');
     if (!user || !user.isActive) return null;
     return {
@@ -214,14 +217,22 @@ export function createSocketServer(httpServer: http.Server): Server {
       const session = remoteCallPresence.getSession(socket.id);
       remoteCallPresence.unregisterSocket(socket.id);
       if (session?.platform === 'android') {
-        for (const sid of remoteCallPresence.getWindowsSockets(session.agentId)) {
-          io.to(sid).emit('device:presence', {
-            platform: 'android',
-            online: false,
-            deviceId: session.deviceId,
-            timestamp: new Date().toISOString(),
-          });
-        }
+        // Brief grace: Android often reconnects within a few seconds (network blip /
+        // token refresh). Delay offline so Windows does not flash a red disconnect.
+        const agentId = session.agentId;
+        const deviceId = session.deviceId;
+        setTimeout(() => {
+          const stillOnline = remoteCallPresence.getAndroidForAgent(agentId);
+          if (stillOnline) return;
+          for (const sid of remoteCallPresence.getWindowsSockets(agentId)) {
+            io.to(sid).emit('device:presence', {
+              platform: 'android',
+              online: false,
+              deviceId,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }, 12_000);
       }
     });
   });

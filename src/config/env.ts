@@ -8,7 +8,10 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   MONGODB_URI: z.string().min(1),
   JWT_SECRET: z.string().min(16),
-  JWT_EXPIRES_IN: z.string().default('7d'),
+  /** Access token lifetime (API + Socket.IO). Keep short; clients refresh automatically. */
+  JWT_EXPIRES_IN: z.string().default('12h'),
+  /** Refresh token lifetime — used only by POST /auth/refresh. */
+  JWT_REFRESH_EXPIRES_IN: z.string().default('60d'),
   S3_ENABLED: z
     .union([z.boolean(), z.string()])
     .optional()
