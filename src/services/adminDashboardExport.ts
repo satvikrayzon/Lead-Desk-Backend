@@ -1,4 +1,5 @@
 import ExcelJS from 'exceljs';
+import type { DailySalesReport } from './dailySalesReportService';
 
 type DashboardExportPayload = {
   range?: { from?: string; to?: string; days?: number };
@@ -19,70 +20,81 @@ function formatTalkCell(seconds: unknown): string {
   return `${sec}s`;
 }
 
-/** Multi-user company dashboard workbook for admin download. */
-export async function buildAdminDashboardWorkbook(payload: DashboardExportPayload): Promise<Buffer> {
+function styleHeader(row: ExcelJS.Row) {
+  row.font = { bold: true };
+  row.fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FFE8EEF9' },
+  };
+}
+
+/**
+ * One Excel workbook with every telecaller as a row (user-wise).
+ * Sheet 1: performance by user
+ * Sheet 2: daily sales by user (when provided)
+ * Sheet 3: key remarks by user
+ */
+export async function buildAdminDashboardWorkbook(
+  payload: DashboardExportPayload,
+  salesReports: DailySalesReport[] = []
+): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Lead Desk';
   wb.created = new Date();
 
   const range = payload.range ?? {};
-  const summary = payload.summary ?? {};
+  const salesById = new Map(salesReports.map((r) => [r.employee.id, r]));
 
-  const summarySheet = wb.addWorksheet('Summary');
-  summarySheet.columns = [
-    { header: 'Metric', key: 'metric', width: 36 },
-    { header: 'Value', key: 'value', width: 24 },
-  ];
-  const summaryRows: Array<[string, string | number]> = [
-    ['Range from', range.from ?? ''],
-    ['Range to', range.to ?? ''],
-    ['Days', range.days ?? ''],
-    ['Total leads', summary.total_leads ?? 0],
-    ['Total telecallers', summary.total_telecallers ?? 0],
-    ['Calls today', summary.calls_today ?? 0],
-    ['Calls in range', summary.calls_last_7_days ?? 0],
-    ['Talk today', formatTalkCell(summary.talk_seconds_today)],
-    ['Talk in range', formatTalkCell(summary.talk_seconds_last_7_days)],
-    ['Talk today (seconds)', summary.talk_seconds_today ?? 0],
-    ['Talk in range (seconds)', summary.talk_seconds_last_7_days ?? 0],
-    ['Pending leads', summary.pending_leads ?? 0],
-    ['Connected calls in range', summary.connected_calls_in_range ?? 0],
-    ['Recordings uploaded in range', summary.recordings_uploaded_in_range ?? 0],
-    ['Recording coverage %', summary.recording_coverage_percent ?? 0],
-    ['Idle telecallers today', summary.idle_telecallers_today ?? 0],
-    ['Overdue follow-ups', summary.overdue_followups ?? 0],
-    ['Due today follow-ups', summary.due_today_followups ?? 0],
-    ['Avg form fill today (sec)', summary.avg_form_fill_seconds_today ?? 0],
-    ['Avg form fill in range (sec)', summary.avg_form_fill_seconds_last_7_days ?? 0],
-  ];
-  for (const [metric, value] of summaryRows) {
-    summarySheet.addRow({ metric, value });
-  }
-  summarySheet.getRow(1).font = { bold: true };
-
-  const teleSheet = wb.addWorksheet('Telecallers');
-  teleSheet.columns = [
-    { header: 'Name', key: 'name', width: 22 },
+  // --- Sheet 1: one row per telecaller (main report) ---
+  const users = wb.addWorksheet('All_Telecallers');
+  users.columns = [
+    { header: 'Telecaller', key: 'name', width: 22 },
     { header: 'Email', key: 'email', width: 28 },
     { header: 'Team', key: 'team', width: 16 },
-    { header: 'Assigned', key: 'assigned', width: 12 },
-    { header: 'Pending', key: 'pending', width: 12 },
-    { header: 'Calls today', key: 'callsToday', width: 12 },
-    { header: 'Calls in range', key: 'callsRange', width: 14 },
-    { header: 'Raw lead calls today', key: 'rawToday', width: 16 },
-    { header: 'Raw lead calls in range', key: 'rawRange', width: 18 },
-    { header: 'Talk today', key: 'talkToday', width: 12 },
-    { header: 'Talk in range', key: 'talkRange', width: 14 },
-    { header: 'Talk today (sec)', key: 'talkTodaySec', width: 14 },
-    { header: 'Talk in range (sec)', key: 'talkRangeSec', width: 16 },
-    { header: 'Follow-ups in range', key: 'followUps', width: 16 },
-    { header: 'Idle today', key: 'idle', width: 12 },
+    { header: 'Report From', key: 'from', width: 12 },
+    { header: 'Report To', key: 'to', width: 12 },
+    { header: 'Assigned Leads', key: 'assigned', width: 14 },
+    { header: 'Pending Leads', key: 'pending', width: 14 },
+    { header: 'Calls Today', key: 'callsToday', width: 12 },
+    { header: 'Calls In Range', key: 'callsRange', width: 14 },
+    { header: 'Raw Lead Calls Today', key: 'rawToday', width: 18 },
+    { header: 'Raw Lead Calls In Range', key: 'rawRange', width: 20 },
+    { header: 'Talk Today', key: 'talkToday', width: 12 },
+    { header: 'Talk In Range', key: 'talkRange', width: 14 },
+    { header: 'Talk Today (sec)', key: 'talkTodaySec', width: 14 },
+    { header: 'Talk In Range (sec)', key: 'talkRangeSec', width: 16 },
+    { header: 'Follow-ups In Range', key: 'followUps', width: 16 },
+    { header: 'Idle Today', key: 'idle', width: 12 },
+    // Sales columns (same range) when available
+    { header: 'Calls Attempted (sales)', key: 'salesAttempted', width: 18 },
+    { header: 'Calls Connected', key: 'salesConnected', width: 14 },
+    { header: 'No Answer', key: 'salesNoAnswer', width: 12 },
+    { header: 'Busy', key: 'salesBusy', width: 10 },
+    { header: 'Wrong Number', key: 'salesWrong', width: 12 },
+    { header: 'Interested', key: 'interested', width: 12 },
+    { header: 'Not Interested', key: 'notInterested', width: 14 },
+    { header: 'Follow-up Required', key: 'fuReq', width: 16 },
+    { header: 'Qualified', key: 'qualified', width: 12 },
+    { header: 'Rate Provided', key: 'rate', width: 12 },
+    { header: 'Closed / Order', key: 'closed', width: 14 },
+    { header: 'Est. Sales Value', key: 'salesValue', width: 14 },
+    { header: 'Talk (sales report)', key: 'salesTalk', width: 14 },
   ];
-  for (const t of payload.telecallers ?? []) {
-    teleSheet.addRow({
+
+  const telecallers = [...(payload.telecallers ?? [])].sort((a, b) =>
+    String(a.name ?? '').localeCompare(String(b.name ?? ''))
+  );
+
+  for (const t of telecallers) {
+    const id = String(t.id ?? '');
+    const sales = salesById.get(id);
+    users.addRow({
       name: t.name ?? '',
       email: t.email ?? '',
       team: t.team_name ?? '',
+      from: range.from ?? '',
+      to: range.to ?? '',
       assigned: t.assigned_leads ?? 0,
       pending: t.pending_leads ?? 0,
       callsToday: t.calls_today ?? 0,
@@ -95,14 +107,116 @@ export async function buildAdminDashboardWorkbook(payload: DashboardExportPayloa
       talkRangeSec: t.talk_seconds_last_7_days ?? 0,
       followUps: t.follow_ups_in_range ?? 0,
       idle: t.idle_today ? 'Yes' : 'No',
+      salesAttempted: sales?.calling.calls_attempted ?? '',
+      salesConnected: sales?.calling.calls_connected ?? '',
+      salesNoAnswer: sales?.calling.no_answer ?? '',
+      salesBusy: sales?.calling.busy_switched_off ?? '',
+      salesWrong: sales?.calling.wrong_number ?? '',
+      interested: sales?.lead_sales.interested ?? '',
+      notInterested: sales?.lead_sales.not_interested ?? '',
+      fuReq: sales?.lead_sales.follow_up_required ?? '',
+      qualified: sales?.lead_sales.qualified_leads ?? '',
+      rate: sales?.lead_sales.rate_provided ?? '',
+      closed: sales?.lead_sales.closed_order_received ?? '',
+      salesValue: sales?.lead_sales.estimated_sales_value ?? '',
+      salesTalk: sales ? formatTalkCell(sales.talk_seconds) : '',
     });
   }
-  teleSheet.getRow(1).font = { bold: true };
+  styleHeader(users.getRow(1));
+  users.views = [{ state: 'frozen', ySplit: 1 }];
 
+  // --- Sheet 2: sales detail one row per user (if any) ---
+  if (salesReports.length > 0) {
+    const salesSheet = wb.addWorksheet('Sales_By_Telecaller');
+    salesSheet.columns = [
+      { header: 'Telecaller', key: 'employee', width: 22 },
+      { header: 'Email', key: 'email', width: 28 },
+      { header: 'Team', key: 'team', width: 16 },
+      { header: 'Date From', key: 'from', width: 12 },
+      { header: 'Date To', key: 'to', width: 12 },
+      { header: 'Calls Attempted', key: 'attempted', width: 14 },
+      { header: 'Raw Lead Calls', key: 'rawCalls', width: 14 },
+      { header: 'Follow-up Calls', key: 'fuCalls', width: 14 },
+      { header: 'Calls Connected', key: 'connected', width: 14 },
+      { header: 'No Answer', key: 'noAnswer', width: 12 },
+      { header: 'Busy/Switched Off', key: 'busy', width: 16 },
+      { header: 'Wrong Number', key: 'wrong', width: 12 },
+      { header: 'Leads Assigned', key: 'assigned', width: 14 },
+      { header: 'Interested', key: 'interested', width: 12 },
+      { header: 'Not Interested', key: 'notInterested', width: 14 },
+      { header: 'Follow-up Required', key: 'fuReq', width: 16 },
+      { header: 'Qualified', key: 'qualified', width: 12 },
+      { header: 'Rate Provided', key: 'rate', width: 12 },
+      { header: 'Closed/Order', key: 'closed', width: 12 },
+      { header: 'Estimated Sales Value', key: 'value', width: 18 },
+      { header: 'Talk Time', key: 'talk', width: 12 },
+      { header: 'Talk Seconds', key: 'talkSec', width: 12 },
+      { header: 'Next Follow-ups', key: 'nextFu', width: 14 },
+    ];
+
+    const sortedSales = [...salesReports].sort((a, b) =>
+      a.employee.name.localeCompare(b.employee.name)
+    );
+    for (const r of sortedSales) {
+      salesSheet.addRow({
+        employee: r.employee.name,
+        email: r.employee.email || '',
+        team: r.employee.team_name || '',
+        from: r.date_from,
+        to: r.date_to,
+        attempted: r.calling.calls_attempted,
+        rawCalls: r.calling.calls_from_raw_leads,
+        fuCalls: r.calling.calls_from_follow_ups,
+        connected: r.calling.calls_connected,
+        noAnswer: r.calling.no_answer,
+        busy: r.calling.busy_switched_off,
+        wrong: r.calling.wrong_number,
+        assigned: r.calling.total_leads_assigned,
+        interested: r.lead_sales.interested,
+        notInterested: r.lead_sales.not_interested,
+        fuReq: r.lead_sales.follow_up_required,
+        qualified: r.lead_sales.qualified_leads,
+        rate: r.lead_sales.rate_provided,
+        closed: r.lead_sales.closed_order_received,
+        value: r.lead_sales.estimated_sales_value,
+        talk: formatTalkCell(r.talk_seconds),
+        talkSec: r.talk_seconds,
+        nextFu: r.next_follow_up.total_follow_up_calls,
+      });
+    }
+    styleHeader(salesSheet.getRow(1));
+    salesSheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+    const remarksSheet = wb.addWorksheet('Remarks_By_Telecaller');
+    remarksSheet.columns = [
+      { header: 'Telecaller', key: 'employee', width: 22 },
+      { header: 'Team', key: 'team', width: 16 },
+      { header: 'Date', key: 'date', width: 12 },
+      { header: 'Lead Code', key: 'code', width: 12 },
+      { header: 'Company', key: 'company', width: 28 },
+      { header: 'Remarks', key: 'remarks', width: 50 },
+    ];
+    for (const r of sortedSales) {
+      for (const note of r.key_remarks) {
+        remarksSheet.addRow({
+          employee: r.employee.name,
+          team: r.employee.team_name || '',
+          date: r.date_display,
+          code: note.lead_code || '',
+          company: note.company_name,
+          remarks: note.remarks,
+        });
+      }
+    }
+    styleHeader(remarksSheet.getRow(1));
+    remarksSheet.views = [{ state: 'frozen', ySplit: 1 }];
+  }
+
+  // --- Sheet: ranking (still user-wise) ---
   const board = wb.addWorksheet('Leaderboard');
   board.columns = [
     { header: 'Rank', key: 'rank', width: 8 },
-    { header: 'Name', key: 'name', width: 22 },
+    { header: 'Telecaller', key: 'name', width: 22 },
     { header: 'Team', key: 'team', width: 16 },
     { header: 'Calls', key: 'calls', width: 10 },
     { header: 'Talk', key: 'talk', width: 12 },
@@ -120,34 +234,7 @@ export async function buildAdminDashboardWorkbook(payload: DashboardExportPayloa
       followUps: row.follow_ups ?? 0,
     });
   }
-  board.getRow(1).font = { bold: true };
-
-  const byDay = wb.addWorksheet('Calls_By_Day');
-  byDay.columns = [
-    { header: 'Date', key: 'date', width: 12 },
-    { header: 'Calls', key: 'count', width: 10 },
-    { header: 'Talk', key: 'talk', width: 12 },
-    { header: 'Talk (sec)', key: 'talkSec', width: 12 },
-  ];
-  for (const d of payload.calls_by_day ?? []) {
-    byDay.addRow({
-      date: d.date,
-      count: d.count ?? 0,
-      talk: formatTalkCell(d.talk_seconds),
-      talkSec: d.talk_seconds ?? 0,
-    });
-  }
-  byDay.getRow(1).font = { bold: true };
-
-  const outcomes = wb.addWorksheet('Outcomes');
-  outcomes.columns = [
-    { header: 'Outcome', key: 'outcome', width: 24 },
-    { header: 'Count', key: 'count', width: 10 },
-  ];
-  for (const o of payload.call_outcomes ?? []) {
-    outcomes.addRow({ outcome: o.outcome, count: o.count });
-  }
-  outcomes.getRow(1).font = { bold: true };
+  styleHeader(board.getRow(1));
 
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);

@@ -690,12 +690,13 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
   wb.creator = 'Lead Desk';
   wb.created = new Date();
 
-  const summary = wb.addWorksheet('Daily_Summary');
+  const summary = wb.addWorksheet('All_Telecallers');
   summary.columns = [
+    { header: 'Telecaller', key: 'employee', width: 22 },
+    { header: 'Email', key: 'email', width: 28 },
+    { header: 'Team', key: 'team', width: 16 },
     { header: 'Date From', key: 'from', width: 12 },
     { header: 'Date To', key: 'to', width: 12 },
-    { header: 'Employee', key: 'employee', width: 22 },
-    { header: 'Team', key: 'team', width: 16 },
     { header: 'State/Region', key: 'state', width: 16 },
     { header: 'Target Area', key: 'area', width: 16 },
     { header: 'Calls Attempted', key: 'attempted', width: 14 },
@@ -718,7 +719,8 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
     { header: 'Next Follow-ups', key: 'nextFu', width: 14 },
   ];
 
-  for (const r of reports) {
+  const sorted = [...reports].sort((a, b) => a.employee.name.localeCompare(b.employee.name));
+  for (const r of sorted) {
     const talkSec = r.talk_seconds ?? 0;
     const h = Math.floor(talkSec / 3600);
     const m = Math.floor((talkSec % 3600) / 60);
@@ -726,10 +728,11 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
     const talkLabel =
       h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${String(sec).padStart(2, '0')}s` : `${sec}s`;
     summary.addRow({
+      employee: r.employee.name,
+      email: r.employee.email || '',
+      team: r.employee.team_name || '',
       from: r.date_from,
       to: r.date_to,
-      employee: r.employee.name,
-      team: r.employee.team_name || '',
       state: r.state_region || '',
       area: r.target_area || '',
       attempted: r.calling.calls_attempted,
@@ -753,20 +756,21 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
     });
   }
   summary.getRow(1).font = { bold: true };
+  summary.views = [{ state: 'frozen', ySplit: 1 }];
 
-  const remarksSheet = wb.addWorksheet('Key_Remarks');
+  const remarksSheet = wb.addWorksheet('Remarks_By_Telecaller');
   remarksSheet.columns = [
+    { header: 'Telecaller', key: 'employee', width: 22 },
     { header: 'Date', key: 'date', width: 12 },
-    { header: 'Employee', key: 'employee', width: 22 },
     { header: 'Lead Code', key: 'code', width: 12 },
     { header: 'Company', key: 'company', width: 28 },
     { header: 'Remarks', key: 'remarks', width: 50 },
   ];
-  for (const r of reports) {
+  for (const r of sorted) {
     for (const note of r.key_remarks) {
       remarksSheet.addRow({
-        date: r.date_display,
         employee: r.employee.name,
+        date: r.date_display,
         code: note.lead_code || '',
         company: note.company_name,
         remarks: note.remarks,
@@ -774,6 +778,7 @@ export async function buildDailySalesReportWorkbook(reports: DailySalesReport[])
     }
   }
   remarksSheet.getRow(1).font = { bold: true };
+  remarksSheet.views = [{ state: 'frozen', ySplit: 1 }];
 
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);

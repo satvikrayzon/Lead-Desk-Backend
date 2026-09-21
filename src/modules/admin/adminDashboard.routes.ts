@@ -90,12 +90,18 @@ adminDashboardRouter.get('/', async (req: AuthRequest, res: Response, next: Next
   }
 });
 
-/** Excel export of the company dashboard (all telecallers + comparison sheets). */
+/** Excel export — all telecallers in one workbook (one row per user). */
 adminDashboardRouter.get('/export', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { days, rangeStart, rangeEndExclusive } = parseAdminDashboardRange(req.query);
-    const data = await loadAdminDashboardPayload(days, rangeStart, rangeEndExclusive);
-    const buffer = await buildAdminDashboardWorkbook(data as Parameters<typeof buildAdminDashboardWorkbook>[0]);
+    const [data, salesReports] = await Promise.all([
+      loadAdminDashboardPayload(days, rangeStart, rangeEndExclusive),
+      buildAllDailySalesReports(rangeStart, rangeEndExclusive),
+    ]);
+    const buffer = await buildAdminDashboardWorkbook(
+      data as Parameters<typeof buildAdminDashboardWorkbook>[0],
+      salesReports
+    );
     const from = (data as { range?: { from?: string } }).range?.from?.replace(/-/g, '') ?? 'from';
     const to = (data as { range?: { to?: string } }).range?.to?.replace(/-/g, '') ?? 'to';
     res.setHeader(
@@ -104,7 +110,7 @@ adminDashboardRouter.get('/export', async (req: AuthRequest, res: Response, next
     );
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="Dashboard_Report_${from}_${to}.xlsx"`
+      `attachment; filename="All_Telecallers_Report_${from}_${to}.xlsx"`
     );
     res.send(buffer);
   } catch (err) {
