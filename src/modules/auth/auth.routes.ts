@@ -5,6 +5,7 @@ import { comparePassword } from '../../utils/password';
 import {
   signAccessToken,
   signRefreshToken,
+  verifyAccessToken,
   verifyRefreshToken,
   AuthRequest,
 } from '../../middleware/auth';
@@ -18,7 +19,7 @@ const loginSchema = z.object({
 });
 
 const refreshSchema = z.object({
-  refreshToken: z.string().min(1, 'Refresh token is required.'),
+  refreshToken: z.string().min(1).optional(),
 });
 
 function tokenPairFor(user: { _id: { toString(): string }; role: string; email: string }) {
@@ -30,6 +31,23 @@ function tokenPairFor(user: { _id: { toString(): string }; role: string; email: 
   const accessToken = signAccessToken(payload);
   const refreshToken = signRefreshToken(payload);
   return { accessToken, refreshToken, token: accessToken };
+}
+
+function userJson(user: {
+  _id: { toString(): string };
+  name: string;
+  email: string;
+  role: string;
+  teamName?: string | null;
+}) {
+  return {
+    id: user._id.toString(),
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    team_name: user.teamName ?? null,
+    team: user.teamName ? { id: null, name: user.teamName } : null,
+  };
 }
 
 export const authRouter = Router();
@@ -69,37 +87,53 @@ authRouter.post('/login', loginRateLimiter, async (req: AuthRequest, res: Respon
 
     res.json({
       ...tokens,
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        team_name: user.teamName ?? null,
-        team: user.teamName ? { id: null, name: user.teamName } : null,
-      },
+      user: userJson(user),
     });
   } catch (err) {
     next(err);
   }
 });
 
-/** Exchange a valid refresh token for a new access + refresh pair (rotation). */
+/**
+ * Issue a fresh access (+ refresh) pair.
+ *
+ * Accepts either:
+ * - `{ refreshToken }` body (preferred, long-lived), or
+ * - `Authorization: Bearer <access>` to bootstrap a refresh token for clients
+ *   that logged in before refresh tokens existed (while access is still valid).
+ */
 authRouter.post('/refresh', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const parsed = refreshSchema.safeParse(req.body);
+    const parsed = refreshSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       throw new AppError(400, 'Invalid request body.');
     }
 
-    let decoded: { sub: string; role: string; email: string };
-    try {
-      decoded = verifyRefreshToken(parsed.data.refreshToken);
-    } catch (err) {
-      if (err instanceof AppError) throw err;
-      throw new AppError(401, 'Invalid refresh token.');
+    let userId: string | null = null;
+
+    const refreshToken = parsed.data.refreshToken?.trim();
+    if (refreshToken) {
+      try {
+        const decoded = verifyRefreshToken(refreshToken);
+        userId = decoded.sub;
+      } catch (err) {
+        if (err instanceof AppError) throw err;
+        throw new AppError(401, 'Invalid refresh token.');
+      }
+    } else {
+      const authHeader = req.headers.authorization;
+      if (!authHeader?.startsWith('Bearer ')) {
+        throw new AppError(401, 'Refresh token required.');
+      }
+      try {
+        const decoded = verifyAccessToken(authHeader.slice(7));
+        userId = decoded.sub;
+      } catch {
+        throw new AppError(401, 'Invalid or expired token.');
+      }
     }
 
-    const user = await User.findById(decoded.sub);
+    const user = await User.findById(userId);
     if (!user || !user.isActive) {
       throw new AppError(401, 'Invalid refresh token.');
     }
@@ -108,14 +142,7 @@ authRouter.post('/refresh', async (req: AuthRequest, res: Response, next: NextFu
 
     res.json({
       ...tokens,
-      user: {
-        id: user._id.toString(),
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        team_name: user.teamName ?? null,
-        team: user.teamName ? { id: null, name: user.teamName } : null,
-      },
+      user: userJson(user),
     });
   } catch (err) {
     next(err);
