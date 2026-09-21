@@ -118,6 +118,93 @@ adminDashboardRouter.get('/export', async (req: AuthRequest, res: Response, next
   }
 });
 
+/**
+ * Activity series for Calls / Talk time chart.
+ * Optional `agent_id` scopes to one telecaller; omit for company-wide.
+ */
+adminDashboardRouter.get('/activity', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { days, rangeStart, rangeEndExclusive } = parseAdminDashboardRange(req.query);
+    const agentIdRaw = typeof req.query.agent_id === 'string' ? req.query.agent_id.trim() : '';
+    if (agentIdRaw && !Types.ObjectId.isValid(agentIdRaw)) {
+      throw new AppError(400, 'Invalid agent id.');
+    }
+
+    let activeAgentIds: Types.ObjectId[];
+    if (agentIdRaw) {
+      activeAgentIds = [new Types.ObjectId(agentIdRaw)];
+    } else {
+      const agents = await User.find({
+        role: { $in: ['agent', 'manager'] },
+        isActive: true,
+      })
+        .select('_id')
+        .lean();
+      activeAgentIds = agents.map((a) => a._id as Types.ObjectId);
+    }
+
+    const dayBuckets: Record<string, { count: number; talk_seconds: number }> = {};
+    {
+      const cursor = new Date(rangeStart);
+      let guard = 0;
+      while (cursor < rangeEndExclusive && guard < 62) {
+        dayBuckets[dateKey(cursor)] = { count: 0, talk_seconds: 0 };
+        cursor.setTime(cursor.getTime() + 24 * 60 * 60 * 1000);
+        guard += 1;
+      }
+    }
+
+    if (activeAgentIds.length === 0) {
+      return res.json({
+        data: {
+          days,
+          agent_id: agentIdRaw || null,
+          calls_by_day: Object.entries(dayBuckets).map(([date, v]) => ({
+            date,
+            count: v.count,
+            talk_seconds: v.talk_seconds,
+          })),
+        },
+      });
+    }
+
+    const [companyDials, rangeRecordings] = await Promise.all([
+      loadCompanyDials(rangeStart, rangeEndExclusive, activeAgentIds),
+      CallRecording.find({
+        agentId: { $in: activeAgentIds },
+        callStartTime: { $gte: rangeStart, $lt: rangeEndExclusive },
+      })
+        .select('callStartTime durationSeconds s3Key s3Bucket')
+        .lean(),
+    ]);
+
+    for (const c of companyDials.dials) {
+      const key = dateKey(new Date(c.startTime));
+      if (key in dayBuckets) dayBuckets[key].count += 1;
+    }
+    for (const r of rangeRecordings) {
+      const key = dateKey(new Date(r.callStartTime));
+      if (key in dayBuckets) {
+        dayBuckets[key].talk_seconds += effectiveRecordingTalkSeconds(r);
+      }
+    }
+
+    res.json({
+      data: {
+        days,
+        agent_id: agentIdRaw || null,
+        calls_by_day: Object.entries(dayBuckets).map(([date, v]) => ({
+          date,
+          count: v.count,
+          talk_seconds: v.talk_seconds,
+        })),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 function parseAdminDashboardRange(query: AuthRequest['query']): {
   days: number;
   rangeStart: Date;
